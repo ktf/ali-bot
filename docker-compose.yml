@@ -7,7 +7,7 @@ services:
     ports:
     - "2181:2181"
   master:
-    image: "alisw${DEVMODE}/mesos-master:1.0.1"
+    image: "alisw${DEVMODE}/mesos-master:1.0.3"
     environment:
       MESOS_MASTER_ZK: zk://zookeeper:2181/mesos
       MESOS_IP: 0.0.0.0
@@ -25,7 +25,7 @@ services:
     - "5050:5050"
     command: sh -ex /run.sh
   slave:
-    image: "alisw${DEVMODE}/mesos-slave:1.0.1"
+    image: "alisw${DEVMODE}/mesos-slave:1.0.3"
     pid: host
     privileged: true
     volumes:
