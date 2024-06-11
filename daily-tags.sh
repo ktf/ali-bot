@@ -60,15 +60,15 @@ git config --global user.email alibuild@cern.ch
 
 # Set the default python and pip depending on the architecture...
 case $ARCHITECTURE in
-  slc6*) PIP=pip PYTHON=python ;;
   *) PIP=pip3 PYTHON=python3 ;;
 esac
 # ...and override it if PYTHON_VERSION is specified.
 case "$PYTHON_VERSION" in
-  2) PIP=pip2 PYTHON=python2 ;;
   3) PIP=pip3 PYTHON=python3 ;;
 esac
 
+# Upgrade pip
+$PIP install --user --upgrade pip
 # Install the latest release if ALIBUILD_SLUG is not provided
 $PIP install --user --upgrade "${ALIBUILD_SLUG:+git+https://github.com/}${ALIBUILD_SLUG:-alibuild}"
 aliBuild analytics off
