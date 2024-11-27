@@ -1,7 +1,7 @@
 ---
 # Create repositories with all O2 prerequisites plus aliBuild and push them
 # upstream (e.g. to S3).
-name: Build o2-full-deps repositories
+name: "Build o2-full-deps repositories"
 
 # Controls when the action will run. This workflow is triggered manually.
 "on":
@@ -27,18 +27,18 @@ jobs:
         include:
           - el_version: el7
             container: centos:7
-            alibuild_tag: v1.17.10
+            alibuild_tag: v1.17.12
           - el_version: el8
             container: almalinux:8
-            alibuild_tag: v1.17.10
+            alibuild_tag: v1.17.12
           - el_version: el9
             container: almalinux:9
-            alibuild_tag: v1.17.7
+            alibuild_tag: v1.17.12
           - el_version: fedora
             container: fedora:40
-            alibuild_tag: v1.17.7
+            alibuild_tag: v1.17.12
 
-    name: RPM (${{ matrix.el_version }})
+    name: "RPM (${{ matrix.el_version }})"
     container: ${{ matrix.container }}
     env:
       ALIBUILD_TAG: ${{ matrix.alibuild_tag }}
@@ -47,8 +47,9 @@ jobs:
 
     steps:
       # For rpms/*.spec
-      - uses: actions/checkout@v3
-      - name: Install prerequisites
+      - uses: actions/checkout@v4
+
+      - name: "Install prerequisites"
         run: |
           set -ex
           if [[ "$DISTRO" == "el7" ]]; then
@@ -66,7 +67,7 @@ jobs:
           ${{ secrets.S3_RCLONE_CONFIG }}
           EOF
 
-      - name: Build the ${{ matrix.el_version }} RPM and create a yum repo
+      - name: "Build the ${{ matrix.el_version }} RPM and create a yum repo"
         run: |
           set -ex
           rpmbuild -ba "rpms/o2-prereq-$DISTRO.spec"
@@ -95,7 +96,6 @@ jobs:
       fail-fast: false
       matrix:
         ubuntu_codename:
-          - bionic  # 18.04
           - focal   # 20.04
           - jammy   # 22.04
           - mantic  # 23.10
@@ -104,24 +104,25 @@ jobs:
     name: DEB (${{ matrix.ubuntu_codename }})
     container: ubuntu:${{ matrix.ubuntu_codename }}
     env:
-      ALIBUILD_TAG: v1.17.7
+      ALIBUILD_TAG: v1.17.12
       ALIBUILD_DISTRO: ${{ matrix.ubuntu_codename }}
       DEBIAN_FRONTEND: noninteractive
-
     steps:
-      - name: Install prerequisites
+      - name: "Install prerequisites"
         run: |
           apt update
           apt install -y vim git devscripts build-essential lintian debhelper dh-python python3-all python3-setuptools python3-setuptools-scm
-          gpg --import - <<\EOF
-          ${{ secrets.LAUNCHPAD_PPA_GPG_KEY }}
-          EOF
+          mkdir -p ~/.gnupg
+          chmod 700 ~/.gnupg
+          echo "pinentry-mode loopback" >> ~/.gnupg/gpg.conf
+          echo -n "${{ secrets.LAUNCHPAD_PPA_GPG_KEY }}" | gpg --no-tty --batch --import
 
-      - name: Build a DEB for Ubuntu and push it to the PPA
+      - name: "Build a DEB for Ubuntu and push it to the PPA"
         run: |
           set -x
-          git clone -b "$ALIBUILD_TAG" https://github.com/alisw/alibuild
+          git clone  https://github.com/alisw/alibuild
           cd alibuild
+          rm -rf .git
           cat <<EOF > debian/changelog
           python3-alibuild (${ALIBUILD_TAG#v}+$ALIBUILD_DISTRO) $ALIBUILD_DISTRO; urgency=medium
 
@@ -129,5 +130,5 @@ jobs:
 
            -- Giulio Eulisse <giulio.eulisse@cern.ch>  $(date -R -u)
           EOF
-          debuild --no-lintian -k48F330BAFFA564EF2383E2B472E9262B5C0D9DE5 -S
+          debuild --no-lintian -kA3A177D7C6BAD5C044ACAC10F56D273E83B84A47 -S -p'gpg --no-tty --passphrase ${{ secrets.LAUNCHPAD_PPA_GPG_PASS }}'
           dput ppa:alisw/ppa "../python3-alibuild_${ALIBUILD_TAG#v}+${ALIBUILD_DISTRO}_source.changes"

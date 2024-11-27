@@ -2,10 +2,7 @@
 from __future__ import print_function
 
 from argparse import ArgumentParser, Namespace
-try:
-    from commands import getstatusoutput
-except ImportError:
-    from subprocess import getstatusoutput
+from subprocess import getstatusoutput
 from collections import deque
 from fnmatch import fnmatch
 from glob import glob
@@ -375,6 +372,7 @@ class Logs(object):
                                        self.fst_task_timeout or
                                        self.fst_failed_command),
                 'hostname': htmlescape(platform.node()),
+                'pr_start_time': os.getenv('PR_START_TIME', ''),
                 'finish_time': datetime.datetime.now().strftime('%a %-d %b %Y, %H:%M:%S %Z'),
                 'repo': self.pr_built.repo_name,
                 'pr_id': self.pr_built.id,
@@ -470,7 +468,7 @@ def get_pending_namespace(args):
                      url="")
 
 
-def handle_branch(cgh, pr, logs, args):
+def handle_branch(cgh: GithubCachedClient, pr, logs, args):
     ns = get_pending_namespace(args) if args.pending else \
         Namespace(commit=args.pr,
                   status=args.status + "/error",
@@ -480,7 +478,7 @@ def handle_branch(cgh, pr, logs, args):
     sys.exit(0)
 
 
-def handle_pr_id(cgh, pr, logs, args):
+def handle_pr_id(cgh: GithubCachedClient, pr, logs, args):
     commit = cgh.get("/repos/{repo_name}/commits/{ref}",
                      repo_name=pr.repo_name,
                      ref=pr.commit)
@@ -591,6 +589,7 @@ PRETTY_LOG_TEMPLATE = '''\
   <h1>The build %(status)s</h1>
   <table>
     <tr><th>Build host</th><td>%(hostname)s</td></tr>
+    <tr><th>Started at</th><td>%(pr_start_time)s</td></tr>
     <tr><th>Finished at</th><td>%(finish_time)s</td></tr>
     <tr><th>Built PR</th>
         <td><a href="https://github.com/%(repo)s/pull/%(pr_id)s">%(repo)s#%(pr_id)s</a></td></tr>

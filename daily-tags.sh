@@ -6,7 +6,7 @@ substitute_vars () {
   value=${value//!!FLPSUITE_LATEST!!/$flpsuite_latest}
   value=${value//!!FLPSUITE_CURRENT!!/$flpsuite_current}
   value=${value//!!ALIDIST_BRANCH!!/$ALIDIST_BRANCH}
-  LANG=C TZ=Europe/Zurich date -d "@$START_TIMESTAMP" "+$value"
+  LANG=C TZ=UTC date -d "@$START_TIMESTAMP" "+$value"
 }
 
 edit_package_tag () {
@@ -126,6 +126,7 @@ alibuild_args=(
   --jobs "${JOBS:-${MAX_CORES:-$(nproc)}}"
   --reference-sources mirror
   ${ARCHITECTURE:+--architecture "$ARCHITECTURE"}
+  ${ALIBUILD_DISABLE:+--disable "$ALIBUILD_DISABLE"}
   ${DEFAULTS:+--defaults "$DEFAULTS"}
   build "$main_pkg"
 )
@@ -157,7 +158,8 @@ EOF
 )
 
 # Finally, replace strftime formatting (%Y, %m, %d etc) in the pattern.
-AUTOTAG_TAG=$(LANG=C TZ=Europe/Zurich date -d "@$START_TIMESTAMP" "+$AUTOTAG_PATTERN")
+# We use the UTC timezone to avoid issues with DST changes.
+AUTOTAG_TAG=$(LANG=C TZ=UTC date -d "@$START_TIMESTAMP" "+$AUTOTAG_PATTERN")
 
 : "${AUTOTAG_TAG:?}"   # make sure the tag isn't empty
 [ "$TEST_TAG" = true ] && AUTOTAG_TAG=TEST-IGNORE-$AUTOTAG_TAG
@@ -222,11 +224,7 @@ for package in $PACKAGES; do (
   fi
 ); done
 
-# Set default remote store -- S3 on slc8 and Ubuntu, rsync everywhere else.
-case "$ARCHITECTURE" in
-  slc[567]_x86-64) : "${REMOTE_STORE:=b3://alibuild-repo::rw}" ;;
-  *) : "${REMOTE_STORE:=b3://alibuild-repo::rw}" ;;
-esac
+: "${REMOTE_STORE:=b3://alibuild-repo::rw}"
 case "$REMOTE_STORE" in
   b3://*)
     set +x  # avoid leaking secrets
