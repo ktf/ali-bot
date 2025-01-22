@@ -17,8 +17,13 @@ classifiers = [
    'Topic :: Software Development :: Build Tools',
    'License :: OSI Approved :: GNU General Public License v3 (GPLv3)',
 
-   'Programming Language :: Python :: 2.6',
-   'Programming Language :: Python :: 2.7'
+   'Programming Language :: Python :: 3.6',
+   'Programming Language :: Python :: 3.8',
+   'Programming Language :: Python :: 3.9',
+   'Programming Language :: Python :: 3.10',
+   'Programming Language :: Python :: 3.11',
+   'Programming Language :: Python :: 3.12',
+   'Programming Language :: Python :: 3.13',
 ]
 
 keywords=[
@@ -33,12 +38,12 @@ dependencies = [
   'pytz',
   's3cmd',
   'pyyaml',
-  'boto3'
+  'boto3==1.35.95'
 ]
 
 [project.optional-dependencies]
 services = [
-  "Twisted==18.9.0",
+  "Twisted",
   "klein",
   "python-ldap"
 ]
@@ -90,7 +95,6 @@ update-symlink-manifests = {path = "update-symlink-manifests"}
 # Get PR information
 prinfo = {path = "ci/prinfo"}
 # Helpers
-clean-repo-ci = {path = "clean-repo-ci"}
 ci-status-overview = {path = "ci-status-overview"}
 bulk-change-pr-status = {path = "utils/bulk-change-pr-status"}
 bulk-change-pr-status-by-checker = {path = "utils/bulk-change-pr-status-by-checker"}
