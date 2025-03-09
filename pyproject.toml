@@ -38,7 +38,7 @@ dependencies = [
   'pytz',
   's3cmd',
   'pyyaml',
-  'boto3==1.35.95'
+  'boto3<1.36.0'
 ]
 
 [project.optional-dependencies]
@@ -74,9 +74,6 @@ continuous-builder.sh = {path = "ci/continuous-builder.sh"}
 build-helpers.sh = {path = "ci/build-helpers.sh"}
 build-loop.sh = {path = "ci/build-loop.sh"}
 cleanup.py = {path = "ci/cleanup.py"}
-# GitHub API monitoring
-monitor-github-api = {path = "monitor-github-api"}
-monitor-github-api-monalisa.sh = {path = "monitor-github-api-monalisa.sh"}
 # S3 housekeeping
 repo-s3-cleanup = {path = "repo-s3-cleanup"}
 # Check daily tags
@@ -92,8 +89,6 @@ sync-egroups.py = {path = "ci/sync-egroups.py"}
 sync-mapusers.py = {path = "ci/sync-mapusers.py"}
 # S3 repo maintenance
 update-symlink-manifests = {path = "update-symlink-manifests"}
-# Get PR information
-prinfo = {path = "ci/prinfo"}
 # Helpers
 ci-status-overview = {path = "ci-status-overview"}
 bulk-change-pr-status = {path = "utils/bulk-change-pr-status"}
