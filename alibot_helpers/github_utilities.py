@@ -1,5 +1,4 @@
 #!/usr/bin/env python
-from __future__ import print_function
 from collections import OrderedDict
 from hashlib import sha1
 import errno
@@ -252,8 +251,8 @@ class GithubCachedClient(object):
         response = requests.post(url=url, data=data, headers=headers)
         sc = response.status_code
         if sc == 422:
-            print(f"GitHub error: Unprocessable Entity", file=sys.stderr)
-            print('This usually means that the commit has reached the maximum number of statuses.')
+            print("GitHub error: Unprocessable Entity", file=sys.stderr)
+            print('This usually means that the commit has reached the maximum number of statuses.', file=sys.stderr)
         return sc
 
     @trace

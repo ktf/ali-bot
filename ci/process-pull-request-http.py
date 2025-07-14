@@ -3,12 +3,14 @@
 from logging import debug, info, warning, error
 from argparse import ArgumentParser
 from os.path import expanduser
-import logging, re, json, yaml
+import logging
+import re
+import json
+import yaml
 from klein import Klein
 from twisted.internet.task import LoopingCall
-from twisted.internet import defer, task, reactor, threads
-from time import sleep, time
-from random import randint
+from twisted.internet import reactor, threads
+from time import time
 from metagit import MetaGit,MetaGitException
 
 class Approvers(object):
@@ -33,7 +35,7 @@ class Approvers(object):
     if user in self.users_override:
       self.approvers = True
       return True
-    if self.approvers == True:
+    if self.approvers is True:
       return True
     ok = False
     for a in self.approvers:
@@ -64,7 +66,7 @@ class Approvers(object):
         self.approvers.append({ "n":num_approvers, "u":approvers })
   def flat(self):
     f = set()
-    if self.approvers == True:
+    if self.approvers is True:
       return f
     for x in self.approvers:
       f.update(x["u"])
@@ -81,7 +83,7 @@ class Approvers(object):
       pass
     return u.strip("@ ")
   def __str__(self):
-    if self.approvers == True:
+    if self.approvers is True:
       return "approved"
     approval_str = [ "%d of %s" % (x["n"], ", ".join(map(self.ghtagmap, x["u"]))) for x in self.approvers ]
     return "; ".join(approval_str)
@@ -174,7 +176,7 @@ class State(object):
   def action_approval_required(self, git, pr, perms, tests):
     pull = git.get_pull(pr, cached=True)
     self.action_approval_pending(git, pr, perms, tests)
-    if self.approvers() != True:
+    if self.approvers() is not True:
       info("%s: approval required by: %s" % (self.sha, self.approvers))
       self.request_approval(git, pr)
 
@@ -196,18 +198,18 @@ class State(object):
         hasChanged = True
         if u["what"] == "test":
           approveTestsOnly = True
-    if self.approvers() == True:
+    if self.approvers() is True:
       git.set_status(pr, "review", "success", \
                          "tests approved" if approveTestsOnly else "merge approved")
       for t in tests:
         git.set_status(pr, t, "pending", "test required")
-    if self.approvers() == True and approveTestsOnly:
+    if self.approvers() is True and approveTestsOnly:
       info("%s: only testing approved, no auto merge on test success" % self.sha)
       git.add_comment(pr, "%s: testing approved: " \
                           "will not be automatically merged; starting testing. " \
                           "If testing succeeds, merging will require further approval from %s" % \
                           (self.sha, str(self.approvers_unchanged)))
-    elif self.approvers() == True:
+    elif self.approvers() is True:
       info("%s: changes approved, auto merge on test success" % self.sha)
       git.add_comment(pr, "%s: approved: will be automatically merged on successful tests" % self.sha)
     else:
@@ -223,7 +225,7 @@ class State(object):
     for u in self.haveApproved_p2:
       if self.approvers.approve(u["u"]):
         hasChanged = True
-    if self.approvers() == True:
+    if self.approvers() is True:
       info("%s: merge approved, merging now" % self.sha)
       git.merge(pr)
     else:
@@ -311,7 +313,7 @@ class Transition(object):
       ha = new_state.haveApproved_p2 if state.name == "STATE_MERGE_APPROVAL_PENDING" else new_state.haveApproved
       ha.append({"u":opener,"what":"test" if named_matches["approval"] == "test" else "merge"})
       debug("evolve: list of approvers updated: %s" % new_state.haveApproved)
-    elif not opener in allowed_openers:
+    elif opener not in allowed_openers:
       debug("evolve: opener %s unallowed to move to state %s" % (opener, self.final_state))
       return state
     elif "approvers" in named_matches:
@@ -460,7 +462,7 @@ class PrRPC(object):
       repo,prnum = pr.split("#", 1)
       prnum = int(prnum)
       debug("Queued PR: %s#%d" % (repo,prnum))
-      if not repo in perms:
+      if repo not in perms:
         debug("Skipping %s: not a configured repository" % pr)
         unprocessed.remove(pr)
         continue
@@ -532,7 +534,7 @@ class PrRPC(object):
       info("* %s @ %s UTC: %s" % (comment.who, comment.when, comment.short))
       for transition in TRANSITIONS:
         new_state = transition.evolve(state, comment.who, comment.short, [bot_user]+admins)
-        if not new_state is state:
+        if new_state is not state:
           # A transition occurred
           info("  ==> %s" % new_state)
           state = new_state
@@ -620,7 +622,7 @@ def load_perms(f_perms, f_groups, f_mapusers, admins):
   try:
     mapusers = yaml.safe_load(open(f_mapusers))
     for k in mapusers:
-      if not " " in mapusers[k]:
+      if " " not in mapusers[k]:
         mapusers[k] = mapusers[k] + " " + mapusers[k]
       un,real = mapusers[k].split(" ", 1)
       realnames[un] = real  # gh -> full
@@ -646,20 +648,20 @@ def load_perms(f_perms, f_groups, f_mapusers, admins):
     # Get internal groups (they override external groups with the same name)
     groups[g] = list(set(c["groups"][g].split()))
   for repo in c:
-    if not "/" in repo: continue
+    if "/" not in repo: continue
     try:
       tests[repo] = c[repo].get("tests", [])
-    except (KeyError,TypeError) as e:
+    except (KeyError,TypeError):
       warning("config %s: wrong syntax for tests in repo %s" % (f_perms, repo))
       tests[repo] = []
     try:
       rules = c[repo].get("rules", [])
-    except (KeyError,TypeError) as e:
+    except (KeyError,TypeError):
       warning("config %s: wrong syntax for rules in repo %s" % (f_perms, repo))
       rules = []
     try:
       repo_admins = c[repo]["admins"].split(",")  # admins are mentioned as approvers in every PR
-    except (KeyError,TypeError) as e:
+    except (KeyError,TypeError):
       repo_admins = []
     perms[repo] = []
     for path_rule in rules:
@@ -676,13 +678,13 @@ def load_perms(f_perms, f_groups, f_mapusers, admins):
             try:
               num_approve = int(a[12:])
               if num_approve < 1: raise ValueError
-            except ValueError as e:
+            except ValueError:
               warning("config %s: invalid %s for repo %s path %s: fallback to 1" % \
                       (cf, a, repo, path_regexp))
               num_approve = 1
         approve += repo_admins  # add admins as approvers to every PR
 
-        auth = [ x for x in auth if not "=" in x ]
+        auth = [ x for x in auth if "=" not in x ]
         # Append rule to perms
         perms[repo].append(Perms(path_regexp=path_regexp,
                                  authorized=auth,
