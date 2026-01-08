@@ -22,8 +22,6 @@ name: Check untested packages
         default: '2'
         description: Maximum number of parallel aliDoctor processes
 
-permissions: {}
-
 jobs:
   check-untested-packages:
     name: Check for untested packages
@@ -33,6 +31,7 @@ jobs:
     permissions:
       contents: read
       pull-requests: write
+      issues: write
 
     steps:
       - name: Checkout ali-bot
