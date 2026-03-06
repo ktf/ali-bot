@@ -169,6 +169,8 @@ if pushd "$PR_REPO_CHECKOUT"; then
     # so we ignore the result code for now
     short_timeout set-github-status ${SILENT:+-n} -c "$PR_REPO@$PR_HASH" -s "$CHECK_NAME/error" -m 'Please resolve merge conflicts' ||
       short_timeout report-analytics exception --desc 'set-github-status fail on cannot merge'
+    PR_OK=0
+    report_state pr_processing_done
     exit 1
   fi
 
@@ -179,6 +181,8 @@ if pushd "$PR_REPO_CHECKOUT"; then
       short_timeout report-analytics exception --desc 'set-github-status fail on merge too big'
     report_pr_errors -m 'Your pull request exceeded the allowed size. If you need to commit large files, [have a look here](http://alisw.github.io/git-advanced/#how-to-use-large-data-files-for-analysis).' ||
       short_timeout report-analytics exception --desc 'report-pr-errors fail on merge diff too big'
+    PR_OK=0
+    report_state pr_processing_done
     exit 1
   fi
 
@@ -196,15 +200,29 @@ then
   short_timeout set-github-status ${SILENT:+-n} -c "$PR_REPO@$PR_HASH" \
                 -s "$CHECK_NAME/success" -m 'skipped; no relevant changes' ||
     short_timeout report-analytics exception --desc 'set-github-status failed on skip'
+  PR_OK=1
+  report_state pr_processing_done
   exit 0
 fi
 
 # Nomad runs this script inside a cgroup managed by it, so it can clean up
 # properly when we exit (or are killed), and it can track CPU/RAM usage.
 # Run our Docker builds inside the same cgroup so they're included too.
-if cgroup=$(sed -rn '/:freezer:/{s/.*:freezer:(.*)/\1/p;q}' "/proc/$$/cgroup"); then
+if cgroup=$(sed -rn '/:freezer:/{s/.*:freezer:(.*)/\1/p;q}; /^0::/{s/^0::(.*)/\1/p;q}' "/proc/$$/cgroup"); then
+  # Docker (systemd cgroup driver) requires --cgroup-parent to be a .slice,
+  # not a .scope. If we're inside a .scope, use its parent .slice instead.
+  [[ $cgroup == *.scope ]] && cgroup=${cgroup%/*}
+  if [[ $cgroup == /* && $cgroup == *".slice"* ]]; then
+    cgroup=${cgroup#/}
+    cgroup=${cgroup%/*.scope}
+    cgroup=${cgroup//\//-}
+    cgroup=${cgroup//.slice-/-}
+    prefix=${cgroup%%-*}
+    [[ -n $prefix && $cgroup == "$prefix-$prefix-"* ]] && cgroup=${cgroup#"$prefix-"}
+    [[ $cgroup == *.slice ]] || cgroup=""
+  fi
   case $cgroup in
-    /) DOCKER_EXTRA_ARGS="$DOCKER_EXTRA_ARGS ${NOMAD_PARENT_CGROUP:+--cgroup-parent=$NOMAD_PARENT_CGROUP}" ;;
+    /|"") DOCKER_EXTRA_ARGS="$DOCKER_EXTRA_ARGS ${NOMAD_PARENT_CGROUP:+--cgroup-parent=$NOMAD_PARENT_CGROUP}" ;;
     *) DOCKER_EXTRA_ARGS="$DOCKER_EXTRA_ARGS ${cgroup:+--cgroup-parent=$cgroup}" ;;
   esac
 fi
@@ -218,6 +236,8 @@ then
     short_timeout report-analytics exception --desc "set-github-status fail on $BUILD_CMD doctor error"
   # If doctor fails, we can move on to the next PR, since we know it will not work.
   # We do not report aliDoctor being ok, because that's really a granted.
+  PR_OK=0
+  report_state pr_processing_done
   exit 1
 fi
 
@@ -257,6 +277,9 @@ if clean_env long_timeout $BUILD_CMD build "$PACKAGE"          \
      ${REMOTE_STORE:+--remote-store "$REMOTE_STORE"}         \
      -e ALIBOT_PR_REPO="$PR_REPO"                            \
      -e "ALIBUILD_O2_TESTS=$ALIBUILD_O2_TESTS"               \
+     -e "ALIBUILD_O2_FORCE_GPU=$ALIBUILD_O2_FORCE_GPU"       \
+     ${USE_RECC:+-e "USE_RECC=$USE_RECC"}                    \
+     ${RECC_LOG_LEVEL:+-e "RECC_LOG_LEVEL=$RECC_LOG_LEVEL"}  \
      -e "ALIBUILD_O2PHYSICS_TESTS=$ALIBUILD_O2PHYSICS_TESTS" \
      -e "ALIBUILD_XJALIENFS_TESTS=$ALIBUILD_XJALIENFS_TESTS" \
      -e "ALIBUILD_HEAD_HASH=$PR_HASH"                        \
