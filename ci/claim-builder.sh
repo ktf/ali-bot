@@ -35,6 +35,18 @@
 
 : "${IDLE_SLEEP:=300}" "${TIMEOUT:=600}" "${LONG_TIMEOUT:=36000}"
 
+# The same identity continuous-builder.sh sets, for the same reason: the build
+# MERGES the PR into the base branch, and git refuses to commit without one --
+# "fatal: empty ident name". This lives in the entrypoint rather than in
+# build-one.sh because it is per-worker setup, not per-PR.
+#
+# Left out of the first version of this script, which is what made the loop fail
+# in setup on every round: the merge died before any compilation, so no build
+# ever ran. Anything else continuous-builder.sh does once at startup belongs
+# here too -- it is not a shared prologue, and nothing warns when it diverges.
+git config --global user.name alibuild
+git config --global user.email alibuild@cern.ch
+
 # The claim key must be globally unique for a piece of work, and *.env names
 # are not: o2-alidist exists under several pools. CHECK_NAME is the GitHub
 # status context, which is unique by construction. Read it in a subshell so the
@@ -43,6 +55,28 @@ function check_name_for () (
   source_env_files "$1" > /dev/null 2>&1 || exit 0
   echo "$CHECK_NAME"
 )
+
+# What this worker has already built, as "$check|$sha" lines.
+#
+# The loop's only other notion of "done" is the GitHub status the build posts,
+# which the lister then sees and stops offering. That breaks down whenever the
+# status does not get written -- SILENT mode during a bring-up, or a failing
+# report-pr-errors -- and the failure mode is a LIVELOCK, not a slowdown: the
+# just-built PR is still untested, still sorts first, and gets rebuilt forever
+# while the rest of the queue starves. Observed on slc10: 11 builds of one PR
+# in five minutes.
+#
+# The sharded loop never needed this because random.sample() picked a different
+# PR each round, so a missing status cost one wasted rebuild rather than all of
+# them. Walking an ordered list is what turns it fatal, and claiming is what
+# makes the list ordered.
+#
+# Keyed by commit, so a new push is a new key and gets built. The cost is that
+# one worker will not rebuild an identical (check, sha) twice in a session,
+# which production does at random to catch flaky failures -- worth losing, since
+# it only delays a retry until this allocation restarts, whereas a livelock
+# stops the queue outright.
+attempted=
 
 while true; do
   # Credentials that expire, refreshed before anything uses them.
@@ -72,6 +106,12 @@ while true; do
       check=$(check_name_for "$env_name")
       [ -n "$check" ] || continue
 
+      # Already built here, whether or not GitHub records it. A plain string
+      # rather than an associative array: macOS builders still run bash 3.2.
+      case $'\n'"$attempted"$'\n' in
+        *$'\n'"$check|$pr_hash"$'\n'*) continue ;;
+      esac
+
       rm -f "$marker"
       BUILD_MARKER=$marker with_claim "$check" "$pr_hash" \
         build-one.sh "$env_name" "$build_type" "$pr_number" "$pr_hash" "$waiting_since" || :
@@ -80,6 +120,10 @@ while true; do
         # We held the claim and the build ran. Re-list rather than walking on:
         # hours have passed and the queue we are holding is now a fossil.
         rm -f "$marker"
+        # Recorded only when we actually built it. Losing the claim must NOT
+        # count: another worker is building it, and if that worker dies this one
+        # should still be able to pick it up on a later round.
+        attempted="${attempted:+$attempted$'\n'}$check|$pr_hash"
         built=1
         break
       fi
