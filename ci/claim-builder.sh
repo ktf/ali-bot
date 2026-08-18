@@ -88,6 +88,27 @@ while true; do
   # The *.env files, from ali-bot@master exactly as the builders use.
   reset_git_repository ali-bot https://github.com/alisw/ali-bot || :
 
+  # ...unless this worker is testing a candidate ali-bot, in which case the
+  # config comes from the SAME ref as the code below. A PR is one thing: if it
+  # changes a *.env and the script that reads it, testing them apart tests a
+  # combination that will never be deployed.
+  #
+  # This is also what makes the override possible at all. INSTALL_ALIBOT is
+  # *defined in* repo-config/DEFAULTS.env, so config fetched from master would
+  # reset the pin on every round and the worker would quietly fall back to
+  # master. The checkout has to move first.
+  if [ -n "$ALIBOT_OVERRIDE" ]; then
+    (
+      cd ali-bot || exit 1
+      # Detached, so reset_git_repository above leaves it alone from now on
+      # (it only resets when HEAD is on a branch) and this block owns the
+      # checkout. Re-fetched every round, so pushes to the PR are picked up.
+      short_timeout git fetch -f "https://github.com/${ALIBOT_OVERRIDE%@*}" \
+                    "+${ALIBOT_OVERRIDE#*@}:refs/ab" &&
+        git checkout -f refs/ab && git clean -fxd
+    ) || :
+  fi
+
   # --all-groups because a worker must be able to walk past PRs other workers
   # have already claimed; the default output stops at the first group and would
   # leave this worker idle whenever its head entry was taken. --no-status keeps
