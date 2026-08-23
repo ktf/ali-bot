@@ -83,6 +83,13 @@ ssl_ctx: ssl.SSLContext = None
 # token minted for one route cannot be replayed against another.
 MASTER: dict[str, bytes | None] = {"current": None, "previous": None}
 PROXY_PORT: int | None = None
+#: The address clients should connect to, advertised over the agent socket
+#: alongside the port. Normally 127.0.0.1, but the listener is bindable
+#: elsewhere ("host" in the config) so the proxy can sit on a private network
+#: shared with, say, a build container that is not in the host's namespace.
+#: Without advertising it, every client helper would keep printing 127.0.0.1
+#: and point at nothing.
+PROXY_HOST: str = "127.0.0.1"
 DEFAULT_AGENT_SOCKET = "~/.security-proxy/agent.sock"
 DEFAULT_ROTATION_SECONDS = 86400
 WS_GATE_SUBPROTOCOL_PREFIX = "security-proxy-token."
@@ -214,6 +221,15 @@ def presented_token(headers, route: Route, query_token: str = "") -> str:
     if auth.lower().startswith("bearer "):
         return auth[7:]
     return query_token
+
+
+def agent_host(reply: dict) -> str:
+    """The address to connect to, from an agent reply.
+
+    Defaults to 127.0.0.1 so a client talking to a proxy that predates the
+    "host" field behaves exactly as before.
+    """
+    return reply.get("host") or "127.0.0.1"
 
 
 def parse_ws_subprotocols(header: str) -> list[str]:
@@ -1474,9 +1490,10 @@ async def run_agent(socket_path: Path, socket_gid: int | None = None):
         try:
             service = (await reader.readline()).decode().strip()
             if not service:
-                resp = {"port": PROXY_PORT}
+                resp = {"port": PROXY_PORT, "host": PROXY_HOST}
             elif service in known:
-                resp = {"port": PROXY_PORT, "service": service, "token": service_token(service)}
+                resp = {"port": PROXY_PORT, "host": PROXY_HOST,
+                        "service": service, "token": service_token(service)}
             else:
                 resp = {"error": f"unknown service {service!r}", "services": sorted(known)}
             writer.write((json.dumps(resp) + "\n").encode())
@@ -1493,11 +1510,14 @@ async def run_agent(socket_path: Path, socket_gid: int | None = None):
 
 async def serve(args, log_config, agent_path: Path, ingest_path: Path, rotation: int):
     """Bind a random localhost port, start the agent + ingest + rotation, run uvicorn."""
-    global PROXY_PORT
+    global PROXY_PORT, PROXY_HOST
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind((args.host, 0))
     PROXY_PORT = sock.getsockname()[1]
+    # A wildcard bind is not an address anyone can connect TO, so keep
+    # advertising the loopback in that case rather than handing out "0.0.0.0".
+    PROXY_HOST = "127.0.0.1" if args.host in ("0.0.0.0", "::", "") else args.host
 
     agent = await run_agent(agent_path, AGENT_SOCKET_GID)
     ingest = await run_ingest(ingest_path, INGEST_SOCKET_GID)
@@ -1633,9 +1653,9 @@ def token_main(argv=None) -> None:
     ap.add_argument("--config", default=None, help="read agent_socket from this config file")
     g = ap.add_mutually_exclusive_group()
     g.add_argument("--port", action="store_true", help="print only the port")
-    g.add_argument("--addr", action="store_true", help="print http://127.0.0.1:<port>")
+    g.add_argument("--addr", action="store_true", help="print http://<host>:<port> (host is 127.0.0.1 unless the proxy binds elsewhere)")
     g.add_argument("--hostport", action="store_true",
-                   help="print 127.0.0.1:<port> (e.g. s3cmd host_base/host_bucket)")
+                   help="print <host>:<port> (e.g. s3cmd host_base/host_bucket)")
     g.add_argument("--json", action="store_true", help="print the raw JSON response")
     a = ap.parse_args(argv)
 
@@ -1653,9 +1673,9 @@ def token_main(argv=None) -> None:
     elif a.port:
         print(data["port"])
     elif a.addr:
-        print(f"http://127.0.0.1:{data['port']}")
+        print(f"http://{agent_host(data)}:{data['port']}")
     elif a.hostport:
-        print(f"127.0.0.1:{data['port']}")
+        print(f"{agent_host(data)}:{data['port']}")
     elif not a.service:
         sys.exit("a service name is required, e.g. `security-proxy-token nomad` "
                  "(use --port/--addr for connection info)")
@@ -1693,7 +1713,7 @@ def mail_token_main(argv=None) -> None:
     if "error" in data:
         sys.exit(f"{data['error']}; known services: {data.get('services', [])}")
 
-    url = f"http://127.0.0.1:{data['port']}/{a.service}/{quote(a.account)}"
+    url = f"http://{agent_host(data)}:{data['port']}/{a.service}/{quote(a.account)}"
     req = urllib.request.Request(url, headers={"Authorization": f"Bearer {data['token']}"})
     try:
         with urllib.request.urlopen(req) as resp:
@@ -1928,7 +1948,7 @@ def _vault_get(spec: dict, agent_socket: Path) -> str | None:
     reply = fetch_from_agent(agent_socket, route)
     if "token" not in reply:
         raise RuntimeError(f"no gate token for the '{route}' route: {reply.get('error', reply)}")
-    url = f"http://127.0.0.1:{reply['port']}/v1/{path}"
+    url = f"http://{agent_host(reply)}:{reply['port']}/v1/{path}"
     req = urllib.request.Request(url, headers={"X-Vault-Token": reply["token"]})
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
@@ -2187,7 +2207,8 @@ cert and key PEM). mTLS routes 503 until it is provisioned -- so the daemon can 
 no cert files on disk at all.
 CLI arguments override config file values.
 
-Authentication: the proxy binds a random 127.0.0.1 port and generates a
+Authentication: the proxy binds a random port (on 127.0.0.1 unless "host"
+says otherwise) and generates a
 high-entropy master secret that rotates every "secret_rotation_seconds" (default
 1 day; the previous secret stays valid for one window). Each route "name" (default:
 its prefix) gets a distinct gate token = HMAC(master, name), so a token for one
