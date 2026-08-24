@@ -287,6 +287,9 @@ fi
 # report-pr-errors looks for errors in it.
 # --docker-extra-args=... uses an equals sign as its arg can start with "--",
 # --which would confuse argparse if passed as a separate argument.
+# The ALICEO2_CCDB_* pair has to be forwarded explicitly: aliBuild builds the
+# container environment from scratch, so an exported variable does not reach the
+# tests. Unset outside the slc10 pool, where the -e is then not passed at all.
 if clean_env long_timeout $BUILD_CMD build "$PACKAGE"          \
      -j "${JOBS:-$(nproc)}" -z "$build_identifier"           \
      --defaults "$ALIBUILD_DEFAULTS"                         \
@@ -304,6 +307,8 @@ if clean_env long_timeout $BUILD_CMD build "$PACKAGE"          \
      -e "ALIBUILD_BASE_HASH=$base_hash"                      \
      ${jalien_token_cert:+-e "JALIEN_TOKEN_CERT=$jalien_token_cert"} \
      ${jalien_token_key:+-e "JALIEN_TOKEN_KEY=$jalien_token_key"} \
+     ${ALICEO2_CCDB_HOST:+-e "ALICEO2_CCDB_HOST=$ALICEO2_CCDB_HOST"} \
+     ${ALICEO2_CCDB_AUTH_TOKEN:+-e "ALICEO2_CCDB_AUTH_TOKEN=$ALICEO2_CCDB_AUTH_TOKEN"} \
      ${use_docker:+--architecture "$ARCHITECTURE"}           \
      ${use_docker:+--docker-image "$CONTAINER_IMAGE"}        \
      ${use_docker:+--docker-extra-args="$DOCKER_EXTRA_ARGS"} \

@@ -38,13 +38,29 @@ unset HASHES
 # Skip quietly if the check disappeared from repo-config between the listing
 # and now -- it is not an error, there is simply nothing to build.
 source_env_files "$env_name" || exit 0
+
+# A candidate ali-bot under test wins over the *.env pin. Applied HERE, after
+# the env files, rather than by making repo-config/DEFAULTS.env respect a
+# pre-set INSTALL_ALIBOT: that file is read by continuous-builder.sh too, in a
+# long-lived shell that exports these and serves several checks in turn, so a
+# ${VAR:-default} there would let the first check's pin stick to every later
+# one. Overriding in this process, which builds exactly one PR and exits, cannot
+# leak anywhere.
+[ -n "$ALIBOT_OVERRIDE" ] && INSTALL_ALIBOT=$ALIBOT_OVERRIDE
+
 export INSTALL_ALIBUILD INSTALL_ALIBOT INSTALL_ALIDIST
 
 # A work area per check, inside whatever directory we were started in. The
 # caller owns that: for a long-lived worker it is the allocation's sticky disk,
 # which is what keeps sw/ and the checkouts warm between builds.
-mkdir -p "$env_name"
-cd "$env_name" || exit 10
+#
+# Qualified by container, because the *.env name alone is not unique: o2-alidist
+# exists under slc10 and ubuntu2204 both. They share nothing that could safely
+# live in one directory -- sw/BUILD/<pkg>-latest and the merged PR checkout are
+# not architecture-namespaced, so two containers in one work area would each
+# clobber the other's tree and report-pr-errors would upload whichever log won.
+mkdir -p "${CUR_CONTAINER:?}/$env_name"
+cd "$CUR_CONTAINER/$env_name" || exit 10
 
 # At the versions this check pins, which is how slc10 gets aliBuild 2.0 while
 # every other check stays on the release in repo-config/DEFAULTS.env.
