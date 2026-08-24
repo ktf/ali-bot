@@ -1364,22 +1364,35 @@ async def proxy(path: str, request: Request):
     proxy_base = f"{request.url.scheme}://{request.headers['host']}"
     prefix = route.prefix.strip("/")
 
-    # Forward response headers, excluding hop-by-hop and rewriting locations
+    # Forward response headers, excluding hop-by-hop and rewriting locations.
+    #
+    # From .raw, and returned as raw_headers, so the upstream's SPELLING
+    # survives: httpx lowercases its decoded view and Starlette lowercases
+    # again when it builds a response, so a plain dict here renames every
+    # header on the way through. Names are case-insensitive only to clients
+    # that treat them so -- O2's CcdbApi keys a std::map on the name exactly as
+    # received, and a lowercased "Cache-Valid-Until" silently disables its
+    # cache: every lookup refetches, and the refetch frees the object the
+    # caller is still holding. That surfaced as a SEGFAULT in
+    # testCcdbApiHeaders, passing on a direct connection and crashing through
+    # here. A proxy has no business renaming what it forwards.
+    #
+    # .raw also preserves repeated headers, which the dict collapsed.
     excluded = {"transfer-encoding", "connection", "keep-alive"}
     if not route.allow_cookies:
         excluded.update(RESPONSE_COOKIE_HEADERS)
     rewrite_headers = {"content-location", "location"}
-    resp_headers = {}
-    for k, v in resp.headers.items():
-        if k.lower() in excluded:
+    raw_headers = []
+    for raw_name, raw_value in resp.headers.raw:
+        lower = raw_name.decode("latin-1").lower()
+        if lower in excluded:
             continue
-        if k.lower() in rewrite_headers:
-            resp_headers[k] = ", ".join(
+        if lower in rewrite_headers:
+            raw_value = ", ".join(
                 rewrite_url(part.strip(), route.upstream, proxy_base, prefix)
-                for part in v.split(",")
-            )
-        else:
-            resp_headers[k] = v
+                for part in raw_value.decode("latin-1").split(",")
+            ).encode("latin-1")
+        raw_headers.append((raw_name, raw_value))
 
     # aiter_raw() forwards the bytes exactly as received, so the forwarded
     # content-encoding / content-length stay consistent (no gzip-length
@@ -1391,11 +1404,11 @@ async def proxy(path: str, request: Request):
         finally:
             await resp.aclose()
 
-    return StreamingResponse(
-        stream_body(),
-        status_code=resp.status_code,
-        headers=resp_headers,
-    )
+    response = StreamingResponse(stream_body(), status_code=resp.status_code)
+    # Assigned after construction: passing headers= would send them through
+    # Starlette's dict, which is what lowercases them.
+    response.raw_headers = raw_headers
+    return response
 
 
 def _socket_modes(socket_gid: int | None) -> tuple[int, int]:
