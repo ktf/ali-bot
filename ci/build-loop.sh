@@ -196,6 +196,33 @@ if pushd "$PR_REPO_CHECKOUT"; then
   popd || exit 1
 fi
 
+# Provenance for this round, in one greppable block: what was claimed, what was
+# actually merged, and every development package's resolved commit. Printed
+# after the merge, so the checkout hash is what will really be built.
+#
+# A worker's log holds many rounds, for many PRs and several checks, and
+# without this the only way to tell which round a failure belongs to is to
+# bisect on timestamps and grep for pinned SHAs -- which has produced wrong
+# answers. Package pins live inside alidist, so the alidist commit here settles
+# "was my recipe fix in this build?" without fetching anything from GitHub.
+#
+# stderr, because that is where the build output goes and where the readers look.
+{
+  printf 'ci-round: check=%s pr=%s#%s head=%s\n' \
+         "${CHECK_NAME:-?}" "${PR_REPO:-?}" "${PR_NUMBER:-?}" "${PR_HASH:-?}"
+  {
+    echo "$PR_REPO_CHECKOUT"
+    [ -z "$DEVEL_PKGS" ] || echo "$DEVEL_PKGS" |
+      while read -r gh_url _ checkout_name; do
+        [ -z "$gh_url" ] || echo "${checkout_name:-$(basename "$gh_url")}"
+      done
+  } | sort -u | while read -r checkout; do
+    [ -d "$checkout/.git" ] || continue
+    printf 'ci-round:   %s=%s\n' "$checkout" \
+           "$(git -C "$checkout" rev-parse HEAD 2>/dev/null || echo unknown)"
+  done
+} >&2
+
 # shellcheck disable=SC2086  # $ONLY_RUN_WHEN_CHANGED must be split by the shell
 # We cannot use an array for $ONLY_RUN_WHEN_CHANGED as *.env files are parsed by
 # Python's shlex, which doesn't parse bash array syntax properly.
