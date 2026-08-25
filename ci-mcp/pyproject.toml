@@ -1,0 +1,9 @@
+[project]
+name = "ci-mcp"
+version = "0.1.0"
+description = "Diagnose the ALICE CI checkers: worker state, build errors, check health"
+requires-python = ">=3.11"
+dependencies = ["mcp==1.26.0", "requests"]
+
+[project.scripts]
+ci-mcp-server = "ci_mcp_server:main"
