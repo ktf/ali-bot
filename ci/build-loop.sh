@@ -151,8 +151,36 @@ unset certdir jalien_token
 report_state pr_processing
 
 NUM_BASE_COMMITS=-1
+
+# A tagged release is built AS TAGGED: fetch the tag, check out exactly that
+# commit, and do not merge anything. TAG_REGEX is what marks a check as building
+# tags (see list-release-tags); it is unset for every pull-request and branch
+# builder, so the block below is untouched for them.
+#
+# The distinction is not cosmetic. The path below resets to $PR_BRANCH and
+# merges $PR_HASH into it -- and a release tag is normally an ANCESTOR of that
+# branch, so the merge succeeds as a no-op, the build produces the BRANCH rather
+# than the release, and publishes it under the release's name. Nothing in that
+# sequence reports an error, which is exactly why it is worth guarding.
+if [ -n "$TAG_REGEX" ]; then
+  # Clone/reset $PR_REPO first. The PR path gets this for free because
+  # DEVEL_PKGS lists $PR_REPO and the loop above checks it out; a release check
+  # need not set DEVEL_PKGS at all, so without this there is no checkout to
+  # pushd into -- and `pushd` failing merely short-circuits the &&, so the tag
+  # is never checked out and the build silently proceeds on whatever is there.
+  reset_git_repository "$PR_REPO_CHECKOUT" "https://github.com/$PR_REPO"
+  pushd "$PR_REPO_CHECKOUT" || exit 1
+  short_timeout git fetch -f origin "+refs/tags/$PR_NUMBER:refs/tags/$PR_NUMBER"
+  git checkout -f "$PR_HASH"      # detached at exactly what was tagged
+  git clean -fxd
+  # No merge, so nothing split off from anything: the release IS the base.
+  base_hash=$PR_HASH
+  NUM_BASE_COMMITS=$(git rev-list --count HEAD)
+  popd || exit 1
+fi
+
 # Fetch the PR's changes to the git repository.
-if pushd "$PR_REPO_CHECKOUT"; then
+if [ -z "$TAG_REGEX" ] && pushd "$PR_REPO_CHECKOUT"; then
   git config --add remote.origin.fetch '+refs/pull/*/head:refs/remotes/origin/pr/*'
   # Only fetch destination branch for PRs (for merging), and the PR we are checking now
   short_timeout git fetch origin "+$PR_BRANCH:refs/remotes/origin/$PR_BRANCH"
@@ -226,7 +254,13 @@ fi
 # shellcheck disable=SC2086  # $ONLY_RUN_WHEN_CHANGED must be split by the shell
 # We cannot use an array for $ONLY_RUN_WHEN_CHANGED as *.env files are parsed by
 # Python's shlex, which doesn't parse bash array syntax properly.
-if (cd "$PR_REPO_CHECKOUT" &&
+# ...but never for a tagged release. This filter asks "did the PR touch
+# anything we care about", and for a tag there is no "the PR": the tag path sets
+# base_hash=$PR_HASH, so the diff is empty by construction and every release
+# would be marked SUCCESS in twenty seconds having built nothing at all. A green
+# release that produced no tarball is worse than a red one.
+if [ -z "$TAG_REGEX" ] &&
+   (cd "$PR_REPO_CHECKOUT" &&
       git diff --quiet "$base_hash...$PR_HASH" -- $ONLY_RUN_WHEN_CHANGED)
 then
   # Exit code 0 from git diff means that nothing has changed and we should skip
@@ -314,6 +348,16 @@ fi
 # report-pr-errors looks for errors in it.
 # --docker-extra-args=... uses an equals sign as its arg can start with "--",
 # --which would confuse argparse if passed as a separate argument.
+# The ALICEO2_CCDB_* variables have to be forwarded explicitly: aliBuild builds
+# the container environment from scratch, so an exported variable does not reach
+# the tests. Unset outside the slc10 pool, where the -e is then not passed at
+# all. ALICEO2_CCDB_AUTH_TOKENS is a table, "<url>=<tok>;<url>=<tok>", because
+# the writable and production endpoints sit behind different broker routes and a
+# broker mints its gate tokens per route.
+# ALIBUILD_EXTRA_ARGS is deliberately UNQUOTED so it word-splits into separate
+# flags -- it is a list of arguments, not one argument, unlike
+# --docker-extra-args above which aliBuild shlex.split()s itself. Empty for
+# every existing check.
 if clean_env long_timeout $BUILD_CMD build "$PACKAGE"          \
      -j "${JOBS:-$(nproc)}" -z "$build_identifier"           \
      --defaults "$ALIBUILD_DEFAULTS"                         \
@@ -331,9 +375,13 @@ if clean_env long_timeout $BUILD_CMD build "$PACKAGE"          \
      -e "ALIBUILD_BASE_HASH=$base_hash"                      \
      ${jalien_token_cert:+-e "JALIEN_TOKEN_CERT=$jalien_token_cert"} \
      ${jalien_token_key:+-e "JALIEN_TOKEN_KEY=$jalien_token_key"} \
+     ${ALICEO2_CCDB_HOST:+-e "ALICEO2_CCDB_HOST=$ALICEO2_CCDB_HOST"} \
+     ${ALICEO2_CCDB_PRODUCTION_HOST:+-e "ALICEO2_CCDB_PRODUCTION_HOST=$ALICEO2_CCDB_PRODUCTION_HOST"} \
+     ${ALICEO2_CCDB_AUTH_TOKENS:+-e "ALICEO2_CCDB_AUTH_TOKENS=$ALICEO2_CCDB_AUTH_TOKENS"} \
      ${use_docker:+--architecture "$ARCHITECTURE"}           \
      ${use_docker:+--docker-image "$CONTAINER_IMAGE"}        \
      ${use_docker:+--docker-extra-args="$DOCKER_EXTRA_ARGS"} \
+     ${ALIBUILD_EXTRA_ARGS:+$ALIBUILD_EXTRA_ARGS}            \
      --fetch-repos --debug --no-auto-cleanup
 then
   if is_numeric "$PR_NUMBER"; then
