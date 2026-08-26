@@ -1054,15 +1054,35 @@ async def ws_proxy(ws: WebSocket, path: str):
         upstream_url = inject_query_token(upstream_url, (route.sso or {}).get("param", "token"),
                                           route.injected_token)
 
-    await ws.accept(subprotocol=subprotocols[0] if subprotocols else None)
-
     connect_kwargs = {"ssl": ssl_ctx}
     if subprotocols:
         connect_kwargs["subprotocols"] = subprotocols
     if ingest_headers:
         connect_kwargs["additional_headers"] = ingest_headers
 
-    async with websockets.connect(upstream_url, **connect_kwargs) as upstream_ws:
+    # Dial upstream BEFORE accepting the client. Accepting first tells the client
+    # "101 Switching Protocols", after which a refusal can no longer be reported:
+    # the exception escapes an already-upgraded connection, uvicorn drops the TCP
+    # socket with no close frame, and upstream's 403, a wrong path and an
+    # unreachable host all reach the client identically as "connection reset by
+    # peer". That indistinguishability cost a wrong diagnosis of `nomad alloc
+    # exec` -- which is a plain 403 for a token without alloc-exec -- and the
+    # misreading is on record in ci-jobs/ci-linux-x86.nomad.
+    try:
+        upstream_ws = await websockets.connect(upstream_url, **connect_kwargs)
+    except websockets.exceptions.InvalidStatus as exc:
+        raise WebSocketDisconnect(
+            code=4003,
+            reason=f"upstream refused the upgrade: {exc.response.status_code}"[:120])
+    except (OSError, asyncio.TimeoutError,
+            websockets.exceptions.WebSocketException) as exc:
+        raise WebSocketDisconnect(
+            code=4004,
+            reason=f"upstream unreachable: {type(exc).__name__}: {exc}"[:120])
+
+    try:
+        await ws.accept(subprotocol=subprotocols[0] if subprotocols else None)
+
         async def client_to_upstream():
             try:
                 while True:
@@ -1082,6 +1102,10 @@ async def ws_proxy(ws: WebSocket, path: str):
                 await ws.close()
 
         await asyncio.gather(client_to_upstream(), upstream_to_client())
+    finally:
+        # `async with` used to do this; the dial moved out of it so its failure
+        # could be reported, so the close is explicit now.
+        await upstream_ws.close()
 
 
 async def proxy_s3(path: str, request: Request, route: Route) -> Response:
