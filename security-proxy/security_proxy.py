@@ -431,8 +431,15 @@ def resolve_ingest_headers(route: Route) -> dict:
     return out
 
 
-def build_upstream_headers(request: Request, route: Route) -> dict:
+def build_upstream_headers(request: Request, route: Route) -> httpx.Headers:
     """Forward safe client headers, then apply ingest-provided headers.
+
+    From .raw into httpx.Headers, which keeps a header repeated by the client
+    repeated upstream. A dict comprehension over .items() silently kept only the
+    last: O2's CcdbApi sends `If-None-Match: <etag>` and then a second
+    `If-None-Match: <timestamp>`, so collapsing dropped the etag, CCDB never
+    answered 304, and every cached object was replaced on each get(). The
+    response path already forwards .raw for the same reason.
 
     May raise SlotUnavailable if a required ingest slot is not yet provisioned."""
     inject = resolve_ingest_headers(route)
@@ -442,7 +449,8 @@ def build_upstream_headers(request: Request, route: Route) -> dict:
     if route.auth_header:
         drop.add(route.auth_header.lower())
     drop.update(h.lower() for h in inject)
-    headers = {k: v for k, v in request.headers.items() if k.lower() not in drop}
+    headers = httpx.Headers([(name, value) for name, value in request.headers.raw
+                             if name.decode("latin-1").lower() not in drop])
     headers.update(inject)
     # Negotiate content-encoding on the client's behalf, not httpx's. We stream the
     # upstream body back raw (aiter_raw), so whatever encoding upstream picks reaches
