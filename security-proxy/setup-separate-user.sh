@@ -238,6 +238,16 @@ echo "==> config (root-owned; cert+secrets are pushed at runtime, not stored her
 #     "attended_slots": {"vault-admin": {"ttl": 300, "max_uses": 1}},
 # and a matching source under "attended" in ~/.security-proxy-bootstrap.json pointing
 # at a *locked* keychain (an unlocked one would defeat the prompt).
+#
+# "ccdb" and "ccdb-prod" deliberately share an upstream HERE, and only here. In
+# CI (ci-jobs/ci-linux-x86.nomad) they are different servers: "ccdb" fronts the
+# writable ccdb-test, because the O2 CCDB suites upload, while "ccdb-prod"
+# fronts production for the tests pinned to objects that exist only there. This
+# host has no ccdb-test route at all, so the second name exists purely so that
+# anything written against the CI shape -- O2's ALICEO2_CCDB_PRODUCTION_HOST and
+# the ALICEO2_CCDB_AUTH_TOKENS table -- resolves locally instead of falling
+# through to "no route matches this path". Route names are what gate tokens are
+# minted from, so the two get DIFFERENT tokens even pointing at one upstream.
 CONFIG_TMP=$(mktemp "$ETC/config.json.XXXXXX")
 cat > "$CONFIG_TMP" <<JSON
 {
@@ -251,6 +261,7 @@ cat > "$CONFIG_TMP" <<JSON
   "attended_slots": {"github-token-rw": {"ttl": 900}, "nomad-rw": {"ttl": 900}},
   "routes": [
     {"prefix": "/ccdb/", "upstream": "https://alice-ccdb.cern.ch"},
+    {"name": "ccdb-prod", "prefix": "/ccdb-prod/", "upstream": "https://alice-ccdb.cern.ch"},
     {"prefix": "/hyperloop/", "upstream": "https://alimonitor.cern.ch/hyperloop"},
     {"prefix": "/remote-mcp/", "upstream": "wss://alien.cern.ch", "websocket": true},
     {"prefix": "/alimonitor/", "upstream": "https://alimonitor.cern.ch"},
