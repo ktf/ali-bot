@@ -1120,6 +1120,11 @@ async def ws_proxy(ws: WebSocket, path: str):
                     await upstream_ws.send(data)
             except WebSocketDisconnect:
                 await upstream_ws.close()
+            except websockets.exceptions.ConnectionClosed:
+                # Upstream went away mid-send. Not an error here: the other pump
+                # owns relaying the close, code and reason included. Uncaught,
+                # this escaped as a traceback and the client got a bare 1000.
+                pass
 
         async def upstream_to_client():
             try:
@@ -1129,7 +1134,21 @@ async def ws_proxy(ws: WebSocket, path: str):
                     else:
                         await ws.send_bytes(msg)
             except websockets.exceptions.ConnectionClosed:
-                await ws.close()
+                pass
+            # Relay the upstream's close code and reason rather than a bare
+            # close. Nomad refuses an unauthorised `alloc exec` by accepting the
+            # upgrade and THEN closing with 1011 "Permission denied", so a
+            # generic close turned a clear denial into "websocket closed before
+            # receiving exit code". 1005/1006 are status codes the protocol
+            # never puts on the wire, so they cannot be forwarded verbatim.
+            code = upstream_ws.close_code
+            reason = upstream_ws.close_reason or ""
+            if code is None or code in (1005, 1006):
+                code = 1000 if code == 1005 else 1011
+            try:
+                await ws.close(code=code, reason=reason[:120])
+            except RuntimeError:
+                pass  # client already gone
 
         await asyncio.gather(client_to_upstream(), upstream_to_client())
     finally:
