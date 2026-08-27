@@ -94,6 +94,31 @@ case $(uname -s) in
     use_docker=true;;
 esac
 
+# recc is only usable if the image we are about to build IN actually ships it:
+# slc9-builder and slc10-builder install it, ubuntu2204-builder does not. With
+# USE_RECC set but no recc present, alidist sets CMAKE_CXX_COMPILER_LAUNCHER=recc
+# and every compile in the container invokes something that is not there.
+#
+# The check belongs HERE and not in the Nomad round-setup, which is where it was
+# first written: that runs before a check is claimed, so the only CONTAINER_IMAGE
+# it can see is the job-level fallback -- and it would happily certify slc10 for
+# a round that then builds in the ubuntu2204 image. By this point the check's own
+# DEFAULTS.env has been sourced and $CONTAINER_IMAGE is the real one.
+#
+# --entrypoint=/bin/sh explicitly: the builder images declare Entrypoint=[""],
+# so relying on the default can exec the empty string.
+if [ -n "$use_docker" ]; then
+  if docker run --rm --entrypoint=/bin/sh "$CONTAINER_IMAGE" \
+         -c 'command -v recc' >/dev/null 2>&1
+  then USE_RECC=${USE_RECC:-1}
+  else USE_RECC=
+  fi
+elif ! command -v recc >/dev/null 2>&1; then
+  USE_RECC=
+fi
+export USE_RECC
+echo "build-loop: USE_RECC=${USE_RECC:-<unset>} for $CONTAINER_IMAGE"
+
 # Get dependency development packages
 if [ -n "$DEVEL_PKGS" ]; then
   echo "$DEVEL_PKGS" | while read -r gh_url branch checkout_name; do
