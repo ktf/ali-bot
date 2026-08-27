@@ -295,6 +295,27 @@ if cgroup=$(sed -rn '/:freezer:/{s/.*:freezer:(.*)/\1/p;q}; /^0::/{s/^0::(.*)/\1
   esac
 fi
 
+# State the memory budget to Docker as well, rather than relying only on the
+# cgroup above. That block is best-effort by construction: the sed can find no
+# cgroup, or it can fall through to a NOMAD_PARENT_CGROUP that is empty, and
+# both cases leave the containers unbounded while looking like they worked.
+#
+# The failure mode when they are unbounded is not a failed build, it is a dead
+# node. On alimetal08 on 2026-08-27 Nomad put its whole allocation utilisation
+# at 1.3 GiB while the host sat at 236 GiB of 251 GiB with ~0% user and ~90%
+# system CPU, and two builders stopped mid-ninja for the better part of an hour
+# -- a reclaim storm, not a compile. Nothing in that reports an error.
+#
+# Derived from the reservation so the limit and the budget cannot drift, less
+# headroom for this script, docker itself and aliBuild outside the container.
+# Equal --memory-swap disables swap for the container: swapping is precisely
+# what turns an overrun into a silent stall instead of a clean OOM kill, and a
+# clean kill is what makes it a failed build we can read.
+if [[ ${NOMAD_MEMORY_LIMIT:-} =~ ^[0-9]+$ ]] && [ "$NOMAD_MEMORY_LIMIT" -gt 4096 ]; then
+  container_mem=$((NOMAD_MEMORY_LIMIT - 4096))
+  DOCKER_EXTRA_ARGS="$DOCKER_EXTRA_ARGS --memory=${container_mem}m --memory-swap=${container_mem}m"
+fi
+
 if ! clean_env short_timeout $BUILD_CMD doctor --defaults "$ALIBUILD_DEFAULTS" "$PACKAGE" \
      ${use_docker:+--architecture "$ARCHITECTURE" --docker-image "$CONTAINER_IMAGE"}
 then
