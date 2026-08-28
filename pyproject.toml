@@ -71,6 +71,7 @@ script-files = [
   "ci/build-loop.sh",
   "ci/cleanup.py",
   "ci/queue-metrics.sh",
+  "ci/bb-cache-metrics.sh",
   "ci/otlp-push.py",
   "ci/claims.sh",
   "ci/claim-builder.sh",
