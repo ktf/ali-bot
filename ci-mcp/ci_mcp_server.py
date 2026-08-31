@@ -21,7 +21,9 @@ here: those are decisions a human makes, and a diagnostic tool that can also
 change the cluster is no longer a diagnostic tool.
 """
 
+import bisect
 import json
+from datetime import datetime
 import os
 import os.path
 import re
@@ -258,6 +260,82 @@ def find_rounds(lines):
             if pkg and index == rounds[-1][0] + len(rounds[-1][4]) + 1:
                 rounds[-1][4][pkg.group(1)] = pkg.group(2)
     return rounds
+
+
+PR_OK_RE = re.compile(r"^\+*\s*PR_OK=([01])\s*$")
+
+
+def stamp_index(lines):
+    """(positions, stamps): every stamped line, in order, for bisecting.
+
+    Built once per call rather than scanned per round. A round banner and the
+    `set -x` traces around it carry no timestamp, and the gap to the first
+    aliBuild line is not small -- measured at 1734 lines on a real worker, where
+    the checkout and merge output sits. Anything with a fixed look-ahead gets
+    this wrong silently.
+    """
+    positions, stamps = [], []
+    for index, raw in enumerate(lines):
+        found = line_time(raw)
+        if found:
+            positions.append(index)
+            stamps.append(found)
+    return positions, stamps
+
+
+def stamp_from(index, at, forward):
+    """The nearest stamp at or after `at` (or at or before it), else None."""
+    positions, stamps = index
+    if forward:
+        slot = bisect.bisect_left(positions, at)
+        return stamps[slot] if slot < len(stamps) else None
+    slot = bisect.bisect_right(positions, at) - 1
+    return stamps[slot] if slot >= 0 else None
+
+
+def round_outcome(lines, start, stop, index):
+    """('ok'|'FAILED'|None, seconds|None) for the round in lines[start:stop].
+
+    build-loop.sh sets PR_OK=1 after reporting success and PR_OK=0 on the
+    failure branch; `set -x` puts exactly one of them in the log per round,
+    after the build and before the next banner. None means no verdict was
+    reached -- still building if this is the last round, killed if it is not.
+    """
+    verdict = end = None
+    for position in range(start, stop):
+        found = PR_OK_RE.match(lines[position].strip())
+        if found:
+            verdict = "ok" if found.group(1) == "1" else "FAILED"
+            end = position
+            break
+    began = stamp_from(index, start, forward=True)
+    ended = stamp_from(index, end, forward=False) if end is not None else None
+    seconds = None
+    if began and ended:
+        try:
+            seconds = (datetime.strptime("%s %s" % ended, "%Y-%m-%d %H:%M:%S")
+                       - datetime.strptime("%s %s" % began, "%Y-%m-%d %H:%M:%S")
+                       ).total_seconds()
+        except ValueError:
+            seconds = None
+    # A window that starts mid-round clips the beginning, so the arithmetic can
+    # come out negative or absurd. Report nothing rather than a wrong number.
+    if seconds is not None and seconds < 0:
+        seconds = None
+    return verdict, seconds
+
+
+def human_duration(seconds):
+    """"1h12m" / "22m03s" / "9s"; "" when it could not be worked out."""
+    if seconds is None:
+        return ""
+    minutes, secs = divmod(int(seconds), 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return "%dh%02dm" % (hours, minutes)
+    if minutes:
+        return "%dm%02ds" % (minutes, secs)
+    return "%ds" % secs
 
 
 def describe_round(entry):
@@ -679,9 +757,17 @@ def ci_rounds(alloc: str, task: str = "ci", window_mb: int = 0) -> str:
     checkout including alidist. Package pins live inside alidist, so the alidist
     commit answers "was my recipe fix in this build?" without fetching anything.
 
+    Each round also carries how it ended and how long it took, read from the
+    PR_OK=0/1 that build-loop.sh sets after the build. "running" is the round in
+    progress; "no verdict" is one that ended without setting it, i.e. the worker
+    was killed or restarted mid-build. A duration is omitted rather than guessed
+    when the window clips the start of a round.
+
     Use this BEFORE ci_build_errors on a claim-based worker: the round number it
     prints can be passed straight back as `round`, which beats guessing a
-    `since` timestamp from a GitHub status in another timezone.
+    `since` timestamp from a GitHub status in another timezone. The outcome
+    column also says which rounds are worth asking about -- there is no point
+    running ci_build_errors over a round that succeeded.
     """
     alloc_id = _resolve_alloc(alloc)
     log, truncated = nomad_log(alloc_id, task,
@@ -694,16 +780,32 @@ def ci_rounds(alloc: str, task: str = "ci", window_mb: int = 0) -> str:
                 "banner in build-loop.sh, or every round in the window started "
                 "before it -- try a larger window_mb."
                 % (alloc_id[:8], window_note(lines, truncated)))
-    out = ["%d round(s) in %s%s"
-           % (len(rounds), alloc_id[:8], window_note(lines, truncated))]
-    for number, entry in enumerate(rounds, start=1):
-        stamp = ""
-        for raw in lines[entry[0]:entry[0] + 8]:
-            found = line_time(raw)
-            if found:
-                stamp = found[1] + " "
-                break
-        out.append("  [round=%d] %s%s" % (number, stamp, describe_round(entry)))
+    stamps = stamp_index(lines)
+    verdicts = []
+    for position, entry in enumerate(rounds):
+        stop = rounds[position + 1][0] if position + 1 < len(rounds) else len(lines)
+        verdict, seconds = round_outcome(lines, entry[0], stop, stamps)
+        if verdict is None:
+            # The last round has simply not finished; an earlier one that never
+            # set PR_OK did not finish either, which is a different thing worth
+            # seeing -- it means the worker died or was restarted mid-build.
+            verdict = "running" if position + 1 == len(rounds) else "no verdict"
+        verdicts.append((verdict, seconds))
+
+    tally = {}
+    for verdict, _ in verdicts:
+        tally[verdict] = tally.get(verdict, 0) + 1
+    summary = ", ".join("%d %s" % (count, name)
+                        for name, count in sorted(tally.items()))
+    out = ["%d round(s) in %s (%s)%s"
+           % (len(rounds), alloc_id[:8], summary,
+              window_note(lines, truncated))]
+    for number, (entry, (verdict, seconds)) in enumerate(zip(rounds, verdicts),
+                                                         start=1):
+        stamp = stamp_from(stamps, entry[0], forward=True)
+        out.append("  [round=%d] %s %-10s %-7s %s"
+                   % (number, stamp[1] if stamp else "        ", verdict,
+                      human_duration(seconds), describe_round(entry)))
     return "\n".join(out)
 
 
