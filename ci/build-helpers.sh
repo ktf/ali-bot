@@ -42,6 +42,7 @@ function report_state () {
   esac
 
   # Push to InfluxDB if configured
+  # shellcheck disable=SC2153  # PR_NUMBER comes from the environment
   influxdb_push prcheck "repo=$PR_REPO" "checkname=$CHECK_NAME" \
                 "worker=$CHECK_NAME/$WORKER_INDEX/$WORKERS_POOL_SIZE" \
                 ${NUM_BASE_COMMITS:+"num_base_commits=$NUM_BASE_COMMITS"} \
@@ -235,8 +236,46 @@ function source_env_files () {
   done
 }
 
+function expand_date_spec () {
+  # Expand %(date) and %(date +FMT) in $1 for the day $2 days ago (default 0).
+  #
+  # Shared by list-release-tags, which uses the result to FIND a tag, and by
+  # build-one.sh, which uses it to PARSE the tag it was given. One expansion in
+  # one place: a release check names its tags once, and the two cannot drift.
+  #
+  # %(date) is shorthand for %(date +%Y%m%d), the form every dated tag in
+  # alidist uses.
+  local spec=$1 day=${2:-0} fmt rest out='' value
+  while [ -n "$spec" ]; do
+    case $spec in
+      *'%(date'*)
+        out=$out${spec%%'%(date'*}
+        rest=${spec#*'%(date'}
+        case $rest in
+          ' +'*) fmt=${rest#' +'}; fmt=${fmt%%')'*}; rest=${rest#*')'} ;;
+          ')'*)  fmt='%Y%m%d';    rest=${rest#')'} ;;
+          *) echo "malformed %(date ...) in: $1" >&2; return 1 ;;
+        esac
+        # GNU and BSD date disagree; these scripts run on the macOS builders too.
+        if date -d "-$day day" +%Y > /dev/null 2>&1; then
+          value=$(date -d "-$day day" "+$fmt")
+        else
+          value=$(date -v-"$day"d "+$fmt")
+        fi
+        out=$out$value
+        spec=$rest
+        ;;
+      *) out=$out$spec; spec= ;;
+    esac
+  done
+  printf '%s' "$out"
+}
+
 function is_numeric () {
-  [ $(($1 + 0)) = "$1" ]
+  # A glob rather than $(($1 + 0)): arithmetic expansion on a release tag prints
+  # "O2PDPSuite-daily-20260825-0000_TEST: value too great for base" to stderr
+  # before returning false, and every release build log carries that line.
+  case $1 in ''|*[!0-9]*) return 1;; *) return 0;; esac
 }
 
 function modtime () {
