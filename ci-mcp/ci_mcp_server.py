@@ -283,14 +283,24 @@ def stamp_index(lines):
     return positions, stamps
 
 
-def stamp_from(index, at, forward):
-    """The nearest stamp at or after `at` (or at or before it), else None."""
+def stamp_from(index, at, forward, limit=None):
+    """The nearest stamp at or after `at` (or at or before it), else None.
+
+    `limit` bounds the search to the caller's own region: without it a round
+    that produced no stamped output at all -- a skipped check reports in well
+    under a second -- borrows a time from its neighbour, which would put a
+    plausible but entirely invented duration on it.
+    """
     positions, stamps = index
     if forward:
         slot = bisect.bisect_left(positions, at)
-        return stamps[slot] if slot < len(stamps) else None
+        if slot >= len(stamps) or (limit is not None and positions[slot] >= limit):
+            return None
+        return stamps[slot]
     slot = bisect.bisect_right(positions, at) - 1
-    return stamps[slot] if slot >= 0 else None
+    if slot < 0 or (limit is not None and positions[slot] < limit):
+        return None
+    return stamps[slot]
 
 
 def round_outcome(lines, start, stop, index):
@@ -308,8 +318,9 @@ def round_outcome(lines, start, stop, index):
             verdict = "ok" if found.group(1) == "1" else "FAILED"
             end = position
             break
-    began = stamp_from(index, start, forward=True)
-    ended = stamp_from(index, end, forward=False) if end is not None else None
+    began = stamp_from(index, start, forward=True, limit=stop)
+    ended = (stamp_from(index, end, forward=False, limit=start)
+             if end is not None else None)
     seconds = None
     if began and ended:
         try:
@@ -319,7 +330,7 @@ def round_outcome(lines, start, stop, index):
         except ValueError:
             seconds = None
     # A window that starts mid-round clips the beginning, so the arithmetic can
-    # come out negative or absurd. Report nothing rather than a wrong number.
+    # still come out negative. Report nothing rather than a wrong number.
     if seconds is not None and seconds < 0:
         seconds = None
     return verdict, seconds
