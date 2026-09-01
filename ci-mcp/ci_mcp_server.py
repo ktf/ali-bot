@@ -967,5 +967,76 @@ def _resolve_alloc(prefix):
     raise ValueError("no allocation starting with %r" % prefix)
 
 
+@mcp.tool()
+def ci_annotate(text: str, tags: str = "", dashboard_uid: str = "",
+                panel_id: int = 0, time_ms: int = 0, time_end_ms: int = 0) -> str:
+    """Mark a moment on the Grafana dashboards, so a change is visible next to
+    its effect.
+
+    A config change whose consequence shows up in a graph hours later is hard to
+    attribute after the fact: the graph moves and nobody remembers what happened
+    at that timestamp. An annotation puts a labelled line at the moment, on every
+    panel whose dashboard queries the matching tag.
+
+    This WRITES to the shared Grafana. Use it for things a colleague reading the
+    dashboard next week would want explained -- a store repointed, a job resized,
+    JOBS changed -- not for routine progress.
+
+    `tags` is comma-separated. Prefer a stable vocabulary so dashboards can query
+    it: "ci,slc10,store" rather than free text. Without a dashboard_uid this is an
+    ORGANISATION annotation, which appears only on dashboards configured with an
+    annotation query matching the tags; pass dashboard_uid (and optionally
+    panel_id) to pin it to one dashboard instead.
+
+    Times are epoch MILLISECONDS, not seconds -- Grafana silently treats a
+    seconds value as 1970 and the annotation lands somewhere invisible. Both
+    default to now; pass time_end_ms for a range (a build window, a rollout).
+    """
+    import time as _time
+    now = int(_time.time() * 1000)
+    start = time_ms or now
+    body = {"time": start, "text": text}
+    if time_end_ms:
+        if time_end_ms < start:
+            return ("time_end_ms (%d) is before time_ms (%d); refusing to write "
+                    "a backwards range" % (time_end_ms, start))
+        body["timeEnd"] = time_end_ms
+    if tags:
+        body["tags"] = [t.strip() for t in tags.split(",") if t.strip()]
+    if dashboard_uid:
+        body["dashboardUID"] = dashboard_uid
+    if panel_id:
+        body["panelId"] = panel_id
+    for field in ("time", "timeEnd"):
+        # A seconds-vs-milliseconds mix-up is the classic way to lose an
+        # annotation, and Grafana accepts it silently. Anything before 2001 in
+        # ms is almost certainly a seconds value.
+        if field in body and body[field] < 1_000_000_000_000:
+            return ("%s=%d looks like epoch SECONDS; this API wants "
+                    "milliseconds" % (field, body[field]))
+
+    try:
+        addr, token = _gate("grafana-annotate")
+    except subprocess.CalledProcessError:
+        return ("no 'grafana-annotate' route on the security-proxy. It needs a "
+                "route to https://monit-grafana.cern.ch injecting a token with "
+                "annotation-write scope, plus the matching ingest slot -- both "
+                "are the human's to provision (see the security-proxy skill). "
+                "Ask for a bogus service to list what is configured.")
+    reply = requests.post(addr + "/grafana/api/annotations", json=body, timeout=60,
+                          headers={"Authorization": token})
+    if reply.status_code >= 400:
+        return ("Grafana refused the annotation (HTTP %d): %s\nA 401/403 here is "
+                "usually the token lacking annotation-write scope rather than the "
+                "route being wrong." % (reply.status_code, clip(reply.text)))
+    ident = ""
+    try:
+        ident = " id=%s" % reply.json().get("id", "")
+    except ValueError:
+        pass
+    return "annotated at %d%s: %s" % (start, ident, text)
+
+
+
 if __name__ == "__main__":
     mcp.run()
