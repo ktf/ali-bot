@@ -366,6 +366,12 @@ find sw/BUILD/ -maxdepth 4 -name coverage.info -delete
 # aliBuild should also delete this file, but make *really* sure there are no
 # leftovers from previous invocations.
 rm -f sw/MIRROR/fetch-log.txt
+# Per-package peak memory, appended by aliBuild's build_template.sh. Truncated
+# HERE rather than after publishing, so a build that dies still leaves behind
+# what it measured before it died -- which is exactly the build you want the
+# numbers for. The work area is sticky, so without this it would accumulate
+# across rounds.
+rm -f sw/peak-memory.tsv
 
 # Only publish packages to remote store when we build the master branch. For
 # PRs, PR_NUMBER will be numeric; in that case, only write to the regular
@@ -453,6 +459,34 @@ else
   report_pr_errors ${DONT_USE_COMMENTS:+--no-comments} ||
     short_timeout report-analytics exception --desc 'report-pr-errors fail on build error'
   PR_OK=0
+fi
+
+# Peak RSS per package, as measured from the build container's own cgroup. The
+# point of this is ANALYSIS_COMPILE_MEMORY_MB: O2Physics sizes its `analysis`
+# ninja pool by dividing the cgroup limit by an assumed 8 GiB per job, taken
+# from the worst producers, and the pool is what paces the whole build. These
+# numbers say what the jobs really used, so the assumption can be checked
+# instead of argued about.
+#
+# Guarded on the URL like report_state, so a job opts in by exporting
+# OTLP_METRICS_URL and every other builder is untouched. Gauges, not counters:
+# a dashboard must not rate() them.
+if [ -n "$OTLP_METRICS_URL" ] && [ -r sw/peak-memory.tsv ]; then
+  while IFS=$'\t' read -r mem_pkg mem_peak mem_limit; do
+    [ -n "$mem_peak" ] || continue
+    # 0 is how build_template.sh spells "could not read the limit"; a series
+    # of zeroes would look like a real limit that collapsed.
+    mem_fields=("peak_mib=$mem_peak")
+    case $mem_limit in
+      ''|0|*[!0-9]*) ;;
+      *) mem_fields+=("limit_mib=$mem_limit") ;;
+    esac
+    otlp-push.py buildmem "repo=$PR_REPO" "checkname=$CHECK_NAME"   \
+                 "arch=${ARCHITECTURE:-unknown}" "package=$mem_pkg" \
+                 -- "${mem_fields[@]}" ||
+      echo "build-loop: OTLP push failed for $mem_pkg, continuing" >&2
+  done < sw/peak-memory.tsv
+  unset mem_pkg mem_peak mem_limit mem_fields
 fi
 
 (
