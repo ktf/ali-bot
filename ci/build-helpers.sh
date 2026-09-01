@@ -52,6 +52,26 @@ function report_state () {
                 ${WAITING_SINCE:+waittime=$((time_now - WAITING_SINCE))} \
                 ${HAVE_JALIEN_TOKEN:+have_jalien_token=$HAVE_JALIEN_TOKEN}
 
+  # ...and the same numbers to Mimir, when the caller has wired OTLP up. Guarded
+  # on the URL rather than on the check name, so a job opts in by exporting
+  # OTLP_METRICS_URL in its round-setup and every other builder is untouched.
+  #
+  # Only the numeric fields go: otlp-push.py turns each FIELD into its own
+  # Prometheus series, and a series whose value is a string is not a thing.
+  # state/host/prid stay InfluxDB-only; state becomes a TAG here instead, which
+  # is what lets a dashboard separate a finished round from a starting one.
+  #
+  # These are GAUGES, not counters -- a dashboard must not rate() them. prtime is
+  # already a duration in seconds, so it is read directly rather than differenced.
+  if [ -n "$OTLP_METRICS_URL" ]; then
+    otlp-push.py prcheck "repo=$PR_REPO" "checkname=$CHECK_NAME" \
+                 "arch=${ARCHITECTURE:-unknown}" "state=$current_state" \
+                 "host=$(hostname -s)" \
+                 -- ${prtime:+"prtime=$prtime"} ${PR_OK:+"prok=$PR_OK"} \
+                 ${WAITING_SINCE:+"waittime=$((time_now - WAITING_SINCE))"} ||
+      echo "report_state: OTLP push failed, continuing" >&2
+  fi
+
   # Push to Google Analytics if configured
   if [ -n "$ALIBOT_ANALYTICS_ID" ] && [ -n "$prtime" ]; then
     short_timeout report-analytics timing --utc 'PR Building' --utv time --utt $((prtime * 1000)) --utl "$CHECK_NAME/$WORKER_INDEX"
