@@ -1,6 +1,8 @@
 # Hash-checked runtime dependency lock for setup-separate-user.sh.
 # Generated for the current macOS arm64 / CPython 3.14 deployment environment.
 # Regenerate this file when changing dependencies, Python, or platform.
+# python-requires: 3.14   (parsed by setup-separate-user.sh -- keep in step
+# with the line above; the wheel hashes below are specific to this version)
 --only-binary=:all:
 
 annotated-doc==0.0.4 \

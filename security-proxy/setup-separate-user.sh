@@ -215,7 +215,43 @@ done
 install -m 0644 "$SRC_DIR/security_proxy.py" "$LIB/security_proxy.py"
 install -m 0644 "$SRC_DIR/pyproject.toml"     "$LIB/pyproject.toml"
 install -m 0644 "$SRC_DIR/requirements.lock"  "$LIB/requirements.lock"
-python3 -m venv "$LIB/venv"
+# Pin the interpreter to the one the lock was generated for. The lock carries ONE
+# wheel hash per package, and cffi/cryptography ship per-Python wheels, so a
+# different minor version downloads a different file and --require-hashes fails:
+#
+#   Expected sha256 c654de54...  (cffi-2.0.0-cp314-cp314-macosx_11_0_arm64.whl)
+#        Got        45d5e886...  (cffi-2.0.0-cp313-cp313-macosx_11_0_arm64.whl)
+#
+# which is exactly what an active virtualenv on PATH produces -- sudo does not
+# reset PATH, so whichever python3 the caller happened to have wins. Ask for the
+# version by name instead of trusting PATH, and say so plainly when it is missing,
+# rather than failing later inside pip with a mismatch that reads like tampering.
+_lock_py=$(sed -n 's/^# python-requires: \([0-9][0-9.]*\).*$/\1/p' "$LIB/requirements.lock")
+: "${_lock_py:?requirements.lock has no '# python-requires:' line}"
+PYTHON=${SECURITY_PROXY_PYTHON:-}
+if [ -z "$PYTHON" ]; then
+  if command -v "python$_lock_py" >/dev/null 2>&1; then PYTHON=python$_lock_py; else PYTHON=python3; fi
+fi
+_have_py=$("$PYTHON" -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || true)
+if [ "$_have_py" != "$_lock_py" ]; then
+  echo "ERROR: requirements.lock is pinned to CPython $_lock_py, but '$PYTHON' is ${_have_py:-unusable}." >&2
+  echo "       Install python$_lock_py, or point SECURITY_PROXY_PYTHON at it:" >&2
+  echo "         sudo SECURITY_PROXY_PYTHON=/opt/homebrew/bin/python$_lock_py bash $0" >&2
+  echo "       (An active virtualenv on PATH is the usual cause: sudo keeps it.)" >&2
+  exit 1
+fi
+# --clear: rebuild rather than reuse, because reuse has been observed to leave a
+# venv that is internally inconsistent. After one run with a 3.13 interpreter on
+# PATH, the deployed venv had pyvenv.cfg and bin/python saying 3.14, a
+# lib/python3.13 AND a lib/python3.14, and a bin/pip whose shebang pointed at
+# 3.13. The next run therefore installed with a 3.13 pip, which fetches cp313
+# wheels and fails --require-hashes against a lock generated for 3.14 -- and it
+# kept failing that way even once PATH had been corrected.
+#
+# Exactly which of venv's steps it skips on an existing directory is not worth
+# depending on either way: --clear removes the question. It costs nothing here,
+# since the installs below are --no-cache-dir and refetch regardless.
+"$PYTHON" -m venv --clear "$LIB/venv"
 "$LIB/venv/bin/pip" install -q --disable-pip-version-check --no-cache-dir \
   --require-hashes -r "$LIB/requirements.lock"
 "$LIB/venv/bin/pip" install -q --disable-pip-version-check --no-cache-dir \
@@ -258,7 +294,8 @@ cat > "$CONFIG_TMP" <<JSON
   "agent_socket_group": "$CLIENT_GROUP",
   "ingest_socket_group": "$PROVISION_GROUP",
   "secret_rotation_seconds": 86400,
-  "attended_slots": {"github-token-rw": {"ttl": 900}, "nomad-rw": {"ttl": 900}},
+  "attended_slots": {"github-token-rw": {"ttl": 900}, "nomad-rw": {"ttl": 900},
+                     "nomad-admin": {"ttl": 300, "max_uses": 5}},
   "routes": [
     {"prefix": "/ccdb/", "upstream": "https://alice-ccdb.cern.ch"},
     {"name": "ccdb-prod", "prefix": "/ccdb-prod/", "upstream": "https://alice-ccdb.cern.ch"},
@@ -275,6 +312,8 @@ cat > "$CONFIG_TMP" <<JSON
      "auth_header": "X-Nomad-Token", "inject_headers": {"X-Nomad-Token": {"ingest": "nomad"}}},
     {"name": "nomad-rw", "upstream": "https://alinomad.cern.ch", "websocket": true,
      "auth_header": "X-Nomad-Token", "inject_headers": {"X-Nomad-Token": {"ingest": "nomad-rw"}}},
+    {"name": "nomad-admin", "upstream": "https://alinomad.cern.ch", "websocket": true,
+     "auth_header": "X-Nomad-Token", "inject_headers": {"X-Nomad-Token": {"ingest": "nomad-admin"}}},
     {"name": "consul", "upstream": "https://aliconsul.cern.ch",
      "auth_header": "X-Consul-Token", "inject_headers": {"X-Consul-Token": {"ingest": "consul"}}},
     {"name": "vault", "upstream": "https://alivault.cern.ch",
