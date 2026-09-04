@@ -402,7 +402,24 @@ def scope_lines(lines, since, round_):
     if parsed is None:
         return lines, 0, ""
     start = window_from(lines, parsed)
-    return lines[start:], start, "since %s %s" % parsed
+    label = "since %s %s" % parsed
+    # A `since` that selects everything, or nothing, is almost always a mistake
+    # rather than an answer -- and silently returning the unfiltered window is
+    # the worst outcome, because the caller then attributes another round's
+    # failures to the one they asked about. That has happened.
+    #
+    # The usual cause is a timezone: a check's "Started ..." on GitHub is UTC
+    # while aliBuild stamps the log in the BUILDER's local clock, so a UTC value
+    # lands an hour or two before the window even opens and trims nothing.
+    if start == 0:
+        label += (" -- WARNING: nothing was trimmed, every line is already at or "
+                  "after it. The log is stamped in the BUILDER's local clock; a "
+                  "UTC time (e.g. from a GitHub status) will be too early. "
+                  "Prefer ci_rounds to get a round number and pass round=")
+    elif start >= len(lines):
+        label += (" -- WARNING: this is after the entire window, so nothing is "
+                  "left. Pass an earlier time, or raise window_mb")
+    return lines[start:], start, label
 
 
 def window_note(lines, truncated, extra=""):
@@ -452,6 +469,12 @@ NOISE_RE = re.compile(
     r"^\s*WARNING:"                      # aliBuild's own downgrade, incl. probes
     r"|^\s*report-analytics:"            # telemetry helpers failing to report;
     r"|^\s*report-metric-monalisa:"      # every round, unrelated to the build
+    #: recc logs an [ERROR] whenever it declines to remote-execute a command and
+    #: falls back to compiling locally -- notably for every link. The build is
+    #: fine; on a macOS O2Physics log this alone was 36 of the 36 "errors",
+    #: pushing the real failure out of the report.
+    r"|\[parsedcommandfactory\.cpp:\d+\] \[ERROR\] Failed to read command-line "
+    r"options from file"
 )
 
 #: Errors that stop a build, as opposed to errors it survives. Used to rank, not
@@ -611,11 +634,17 @@ def ci_build_errors(alloc: str, task: str = "ci", max_errors: int = 12,
 
     alloc may be a short id prefix, as with the nomad CLI.
 
-    PASS `since` FOR A CLAIM-BASED WORKER. Those allocations are long-lived and
-    their log holds many rounds for many PRs and several checks, so without it
-    you get this round's failure next to an unrelated one from yesterday, with
-    nothing to tell them apart. Take the check's "Started ..." time from its
-    GitHub status -- that is UTC, the log is local -- and pass it as "HH:MM".
+    SCOPE IT ON A CLAIM-BASED WORKER. Those allocations are long-lived and their
+    log holds many rounds for many PRs and several checks, so unscoped you get
+    this round's failure next to an unrelated one from yesterday with nothing to
+    tell them apart.
+
+    PREFER `round`: call ci_rounds first and pass the number back. It is exact.
+
+    `since` is the fallback and is easy to get wrong: the log is stamped in the
+    BUILDER's local clock, while a check's "Started ..." on GitHub is UTC, so
+    passing the latter unconverted selects the whole window and silently scopes
+    nothing. The reply now says when that happened -- believe it.
 
     `window_mb` overrides how far back to read (default 64). The reply always
     says what was covered and whether the window filled up.
@@ -876,6 +905,38 @@ def ci_check_status(check_name: str, repo: str) -> str:
     return "\n".join(out)
 
 
+#: Where report-pr-errors uploads a build's log. This is the ONLY durable record
+#: of a build: Nomad garbage-collects allocations out of `job status
+#: -all-allocs` within hours, and a busy claim worker's log rotates inside about
+#: 45 minutes, but this survives. On 2026-09-04 it was the only thing that named
+#: which machine had reddened ~70 pull requests -- Nomad had already forgotten
+#: the allocation, and reading -all-allocs led to the WRONG machine.
+BUILD_LOG_BUCKET = "alice-build-logs"
+
+
+def s3_get(key, timeout=120):
+    """One object from the CERN S3 through the security-proxy s3 route.
+
+    The proxy signs for real; the client sends an effectively-unsigned SigV4
+    whose access-key-id is the rotating gate token, which is what the proxy
+    validates. Hence the placeholder signature -- it is never checked, and no
+    real credential is present on this side.
+    """
+    addr, token = _gate("s3")
+    reply = requests.get(
+        "%s/%s/%s" % (addr, BUILD_LOG_BUCKET, key), timeout=timeout,
+        headers={
+            "Authorization": ("AWS4-HMAC-SHA256 Credential=%s/00000000/default/"
+                              "s3/aws4_request, SignedHeaders=host, "
+                              "Signature=unsigned" % token),
+            "x-amz-content-sha256": "UNSIGNED-PAYLOAD",
+        })
+    if reply.status_code == 404:
+        return None
+    reply.raise_for_status()
+    return reply.text
+
+
 @mcp.tool()
 def ci_pr(repo: str, number: int) -> str:
     """Every check on a PR's head commit, and which of them are red."""
@@ -897,6 +958,96 @@ def ci_pr(repo: str, number: int) -> str:
     for ctx in sorted(contexts, key=lambda c: (c["state"] != "ERROR", c["context"])):
         out.append("  %-9s %-44s %s" % (ctx["state"].lower(), ctx["context"],
                                         (ctx["description"] or "")[:40]))
+    return "\n".join(out[:MAX_RETURN_LINES])
+
+
+@mcp.tool()
+def ci_build_log(repo: str, pr: int, check_name: str, sha: str = "",
+                 max_errors: int = 12) -> str:
+    """Why a check went red, starting from the PR rather than from a worker.
+
+    Reads the log report-pr-errors uploaded to s3://alice-build-logs, which is
+    the only durable record of a build. Use this whenever you have a red check
+    and no allocation, or when the allocation is gone -- Nomad drops them from
+    `job status -all-allocs` within hours and a claim worker's own log rotates
+    in under an hour, while this does not.
+
+    It answers WHICH MACHINE ran the build, which the GitHub status does not say
+    and a garbage-collected allocation can no longer tell you.
+
+    `sha` defaults to the PR's current head. Pass it explicitly to read an older
+    attempt, since the path is keyed by commit.
+
+    check_name is the GitHub context, e.g. "build/O2Physics/o2/macOS-arm".
+    """
+    owner, _, name = repo.partition("/")
+    if not sha:
+        data = github_graphql("""
+        query($o:String!,$n:String!,$p:Int!){repository(owner:$o,name:$n){
+          pullRequest(number:$p){headRefOid}}}
+        """, o=owner, n=name, p=pr)
+        sha = data["repository"]["pullRequest"]["headRefOid"]
+    key = "%s/%d/%s/%s/fullLog.txt" % (repo, pr, sha, check_name.replace("/", "_"))
+    log = s3_get(key)
+    if log is None:
+        return ("no uploaded log at s3://%s/%s\n"
+                "Either the check never ran for this commit, the name is wrong "
+                "(it is the GitHub context, e.g. build/O2Physics/o2/macOS-arm), "
+                "or the build was killed before report-pr-errors ran -- which "
+                "leaves the PR on a stale 'pending' status."
+                % (BUILD_LOG_BUCKET, key))
+
+    lines = log.splitlines()
+    out = ["%s#%d %s  (%.8s, %d bytes)" % (repo, pr, check_name, sha, len(log))]
+    # The header report-pr-errors writes: host and allocation. This is the whole
+    # reason to prefer this over the Nomad log.
+    for raw in lines[:12]:
+        if raw.startswith(("Finished building on", "Built commit",
+                           "Nomad allocation:")) or raw.strip().startswith("http"):
+            out.append("  " + clip(raw.strip()))
+
+    # A few hundred bytes ending in "No logs found" is not a failed PR, it is a
+    # broken machine: the build produced nothing at all. That was the signature
+    # of the missing-SDK failure, and it reads as an ordinary red check.
+    if len(log) < 2000 and "No logs found" in log:
+        out.append("")
+        out.append("  *** THE BUILD PRODUCED NO OUTPUT (%d bytes, 'No logs "
+                   "found'). This is a BROKEN BUILDER, not a broken PR -- the "
+                   "machine failed before compiling anything. Check the host "
+                   "named above." % len(log))
+        return "\n".join(out)
+
+    hits, kinds, skipped = {}, Counter(), 0
+    for position, raw in enumerate(lines):
+        line = strip_alibuild_prefix(raw)
+        if NOISE_RE.search(line):
+            skipped += 1
+            continue
+        for kind, pattern in PATTERNS.items():
+            if pattern.search(line):
+                key_ = (kind, re.sub(r"\d+", "#", line)[:MAX_LINE_CHARS])
+                if key_ in hits:
+                    hits[key_][0] += 1
+                    hits[key_][3] = position
+                else:
+                    hits[key_] = [1, with_body(lines, position, kind), kind,
+                                  position]
+                kinds[kind] += 1
+                break
+    if not hits:
+        out.append("")
+        out.append("  no recognised errors in %d lines (%d suppressed as noise)."
+                   % (len(lines), skipped))
+        return "\n".join(out)
+
+    out.append("")
+    out.append("  %d distinct error(s), %s" % (
+        len(hits), ", ".join("%s=%d" % kv for kv in kinds.most_common())))
+    # Latest-first: the decisive error is the last one, everything after it is
+    # teardown. Same reasoning as ci_build_errors.
+    for count, sample, kind, _ in sorted(hits.values(), key=lambda e: -e[3])[:max_errors]:
+        body = "\n".join(clip(l) for l in sample.splitlines())
+        out.append("  [%s%s] %s" % (kind, " x%d" % count if count > 1 else "", body))
     return "\n".join(out[:MAX_RETURN_LINES])
 
 
