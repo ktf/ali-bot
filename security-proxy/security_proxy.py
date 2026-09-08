@@ -990,6 +990,21 @@ def rewrite_url(value: str, upstream: str, proxy_base: str, prefix: str) -> str:
     """Rewrite URLs pointing to the upstream server to point to the proxy instead."""
     if value.startswith(upstream):
         return proxy_base + "/" + prefix + value[len(upstream):]
+    # A ROOT-RELATIVE target needs the prefix too. CCDB answers an object GET with
+    # `Location: /Task/Detector/.../<uuid>` -- no host -- and the client resolves it
+    # against the PROXY base, which has no /ccdb/ on it, so it lands on no route and
+    # 404s. Every object fetch redirects to its blob, so without this only the
+    # non-redirecting calls (/browse/) work and every actual download fails with
+    # "Unable to find CCDB object".
+    #
+    # Only for an UNSCOPED upstream. When the upstream carries a path
+    # (https://alimonitor.cern.ch/hyperloop) that path is the route's scope, and a
+    # root-relative target is by definition outside it -- re-prefixing would smuggle
+    # it back in with the proxy's credential attached, which upstream_url_for()
+    # refuses for exactly this reason. Leave those alone.
+    if prefix and value.startswith("/") and not value.startswith("//"):
+        if not urlsplit(upstream).path.strip("/"):
+            return proxy_base + "/" + prefix + value
     return value
 
 
@@ -1616,9 +1631,23 @@ async def serve(args, log_config, agent_path: Path, ingest_path: Path, rotation:
     agent = await run_agent(agent_path, AGENT_SOCKET_GID)
     ingest = await run_ingest(ingest_path, INGEST_SOCKET_GID)
 
+    # Only remove sockets THIS process created. A proxy orphaned by a task
+    # restart (su forks; Nomad kills su, not the daemon) keeps running, and a
+    # later kill of that orphan ran this cleanup against paths that by then
+    # belonged to the replacement daemon -- which kept its bound fds but lost
+    # its filesystem entries, so every client got ENOENT. Compare inodes:
+    # a path re-bound by someone else is not ours to unlink.
+    def _socket_ino(path):
+        try:
+            return os.stat(path).st_ino
+        except OSError:
+            return None
+    agent_ino, ingest_ino = _socket_ino(agent_path), _socket_ino(ingest_path)
+
     def _cleanup_sockets():
-        agent_path.unlink(missing_ok=True)
-        ingest_path.unlink(missing_ok=True)
+        for path, ino in ((agent_path, agent_ino), (ingest_path, ingest_ino)):
+            if ino is not None and _socket_ino(path) == ino:
+                path.unlink(missing_ok=True)
     atexit.register(_cleanup_sockets)  # backstop cleanup
 
     print(f"Proxy on http://{args.host}:{PROXY_PORT} (random port)", flush=True)
