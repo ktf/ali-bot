@@ -70,8 +70,29 @@ case "$BUILD_TYPE" in
                              ${NOMAD_ALLOC_ID:+--log-url "https://alinomad.cern.ch/ui/allocations/$NOMAD_ALLOC_ID"} ;;
   # Rebuilds only change the existing status's message, keeping the red status
   # and URL intact.
-  failed) set-github-status -k -c "$PR_REPO@$PR_HASH" -s "$CHECK_NAME/$(build_type_to_status "$BUILD_TYPE")" \
-                            -m "Rechecking since $PR_START_TIME on $host_id" ;;
+  #
+  # Exit 3 means the commit has exhausted GitHub's status quota for this
+  # context, so the result of this build could never be recorded: the check
+  # would stay red, the queue would offer it again as `failed`, and the worker
+  # would rebuild it for as long as the PR stays open. alidist#6245 did exactly
+  # that -- 2000 of 5344 rounds across the fleet, 37% of all CI capacity, spent
+  # on one pull request whose verdict was unwritable since 2026-08-17.
+  #
+  # Give up the round here, before the build rather than after it. The check
+  # keeps its last value, which is the only outcome GitHub will accept; a human
+  # clears it by pushing a new commit, which resets the quota.
+  failed) _status_rc=0
+          set-github-status -k -c "$PR_REPO@$PR_HASH" -s "$CHECK_NAME/$(build_type_to_status "$BUILD_TYPE")" \
+                            -m "Rechecking since $PR_START_TIME on $host_id" || _status_rc=$?
+          if [ "$_status_rc" -eq 3 ]; then
+            echo "build-loop: $PR_REPO@$PR_HASH has reached GitHub's status limit for" \
+                 "$CHECK_NAME; skipping this build, push a new commit to reset it" >&2
+            # PR_OK deliberately left unset: nothing was built, so report_state
+            # omits prok rather than recording a failure that never happened.
+            report_state pr_processing_done
+            exit 0
+          fi
+          unset _status_rc ;;
   # See above for why we don't update the status for green checks.
   succeeded) ;;
 esac
