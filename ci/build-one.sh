@@ -121,9 +121,32 @@ cd "$CUR_CONTAINER/$env_name" || exit 10
 
 # At the versions this check pins, which is how slc10 gets aliBuild 2.0 while
 # every other check stays on the release in repo-config/DEFAULTS.env.
-short_timeout python3 -m pip install --upgrade --no-binary=ali-bot \
+#
+# Into a venv PER CHECK, not the allocation's. pip installs scripts by name, so
+# two checks pinning different tools overwrite each other's venv/bin/aliBuild:
+# bits #114 added aliBuild to its script-files and every later check on the
+# worker silently ran bits instead. The allocation venv keeps its own alibuild
+# for cleanup.py -- untouched here, and nothing is deleted from either.
+tool_pin="${INSTALL_ALIBOT:?} ${INSTALL_ALIBUILD:?}"
+[ "$(cat .toolpin 2>/dev/null)" = "$tool_pin" ] || rm -rf .venv
+cold=
+if [ ! -x .venv/bin/python3 ]; then
+  python3 -m venv .venv || exit 1
+  general_timeout 900 .venv/bin/python3 -m pip install --upgrade pip || exit 1
+  cold=1
+fi
+# First on PATH, so `python3 -m pip` below installs HERE and build-loop.sh
+# resolves aliBuild/bits and the ali-bot CLIs to this check's pins.
+export PATH="$PWD/.venv/bin:$PATH"
+
+# $TIMEOUT is as low as 120s on some checks: fine to upgrade an existing venv,
+# not enough to populate a fresh one.
+pip_timeout=short_timeout
+[ -n "$cold" ] && pip_timeout="general_timeout 900"
+$pip_timeout python3 -m pip install --upgrade --no-binary=ali-bot \
     "ali-bot[ci] @ git+https://github.com/${INSTALL_ALIBOT:?}"     \
     "git+https://github.com/${INSTALL_ALIBUILD:?}" || exit 1
+printf '%s\n' "$tool_pin" > .toolpin
 
 # The build itself, shared verbatim with the production builders.
 . build-loop.sh
