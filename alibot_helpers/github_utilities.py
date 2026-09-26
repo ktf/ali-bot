@@ -255,7 +255,10 @@ class GithubCachedClient(object):
         return limits
 
     def printStats(self):
-        print("Github API used %s/%s" % self.rate_limiting, file=sys.stderr)
+        # rate_limiting is (remaining, limit), and this said "used" -- so a full
+        # budget read as an exhausted one. REST, not the separate GraphQL one.
+        print("Github REST API: %s/%s requests left" % self.rate_limiting,
+              file=sys.stderr)
 
     def makeURL(self, template, **kwds):
         template = template[1:] if template.startswith('/') else template
