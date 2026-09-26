@@ -110,8 +110,14 @@ done
 # WORKERS_POOL_SIZE=1 makes should_process() accept every PR, so we see the
 # whole queue rather than one worker's shard. --no-status keeps us read-only:
 # we must not interfere with the statuses the builders set.
+# --cache-ttl: one process runs per pool and they ask the same questions, so
+# without this a cycle spends 33 GraphQL queries on 15 distinct (repo, branch)
+# pairs. Just under QUEUE_METRICS_INTERVAL, so each cycle starts cold and a
+# reading is never older than one interval. Read-only here (--no-status); a
+# builder must not pick work from a stale listing.
 if queue=$(WORKER_INDEX=0 WORKERS_POOL_SIZE=1 \
-           short_timeout list-branch-pr --all-groups --no-status)
+           short_timeout list-branch-pr --all-groups --no-status \
+                         --cache-ttl "${QUEUE_METRICS_CACHE_TTL:-110}")
 then
   poll_ok=1
 else

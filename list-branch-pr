@@ -26,10 +26,13 @@ was added while this list still described four.
 import functools
 import glob
 import hashlib
+import json
 import os
 import os.path
 import random
 import sys
+import tempfile
+import time
 
 from argparse import ArgumentParser, Namespace
 from collections import defaultdict
@@ -51,10 +54,55 @@ DEFAULTENV_NAME = "DEFAULTS.env"
 PRIORITY_LABEL = "ci-priority"
 
 
+#: Set from --cache-ttl / --cache-dir; off unless a caller asks for it.
+_CACHE_TTL = 0
+_CACHE_DIR = None
+
+
+def _cache_file(org, repo, base_branch, include_base_branch):
+    """Path holding the cached answer for one (repo, branch)."""
+    key = "\0".join((github_api_url(), org, repo, base_branch,
+                      str(bool(include_base_branch))))
+    return os.path.join(_CACHE_DIR,
+                        hashlib.sha256(key.encode()).hexdigest() + ".json")
+
+
+def _cache_read(path):
+    """The cached answer, or None if absent, stale or unreadable."""
+    try:
+        if time.time() - os.stat(path).st_mtime > _CACHE_TTL:
+            return None
+        with open(path) as cached:
+            return json.load(cached)
+    except (OSError, ValueError):
+        return None
+
+
+def _cache_write(path, value):
+    """Store an answer; failing to cache is not failing to answer."""
+    try:
+        os.makedirs(_CACHE_DIR, mode=0o700, exist_ok=True)
+        # Renamed into place: the readers are concurrent sibling processes.
+        tmp = "%s.%d.tmp" % (path, os.getpid())
+        with open(tmp, "w") as out:
+            json.dump(value, out)
+        os.replace(tmp, path)
+    except (OSError, TypeError, ValueError):
+        pass
+
+
 @functools.lru_cache(maxsize=None)
 def query_repo_info(session, org, repo, base_branch, include_base_branch=False):
     """Query the given repo to get pull request statuses."""
-    return session.execute(GraphQLRequest(
+    # Across processes, where lru_cache cannot reach: the queue collector runs
+    # one process per pool and the pools ask the same questions.
+    if _CACHE_TTL > 0:
+        path = _cache_file(org, repo, base_branch, include_base_branch)
+        cached = _cache_read(path)
+        if cached is not None:
+            return cached["repository"]
+
+    result = session.execute(GraphQLRequest(
         QUERY.document,
         variable_values={
             "repoOwner": org,
@@ -63,7 +111,10 @@ def query_repo_info(session, org, repo, base_branch, include_base_branch=False):
             "includeBaseBranch": include_base_branch,
         },
         operation_name="statuses",
-    ))["repository"]
+    ))
+    if _CACHE_TTL > 0:
+        _cache_write(path, result)
+    return result["repository"]
 
 
 @functools.lru_cache(maxsize=None)
@@ -271,6 +322,11 @@ class RepoConfig:
 
 def main(args):
     """Script entry point."""
+    # getattr: the tests call main() with a hand-built Namespace.
+    global _CACHE_TTL, _CACHE_DIR
+    _CACHE_TTL = getattr(args, "cache_ttl", 0) or 0
+    _CACHE_DIR = getattr(args, "cache_dir", None)
+
     grouped = defaultdict(list)
     # Find .env files for this worker, parse them and find PRs to process for
     # each build config.
@@ -438,6 +494,20 @@ def parse_args():
               " current Mesos role and container (default ALIBOT_CONFIG_SUFFIX="
               "%(default)s or empty if undefined). If %(metavar)s starts with a"
               " dash, use -s=%(metavar)s instead of -s %(metavar)s."))
+
+    parser.add_argument(
+        "--cache-ttl", metavar="SECONDS", type=int, default=0,
+        help=("Reuse another invocation's answer for the same repository and"
+              " branch if it is younger than %(metavar)s seconds (default"
+              " %(default)s, i.e. no reuse). Read-only callers only: a builder"
+              " must not choose what to claim from a stale listing."))
+
+    parser.add_argument(
+        "--cache-dir", metavar="DIR",
+        default=os.environ.get("LIST_BRANCH_PR_CACHE_DIR") or
+                os.path.join(tempfile.gettempdir(),
+                             "list-branch-pr-cache-%d" % os.getuid()),
+        help="Where --cache-ttl keeps its answers (default %(default)s).")
 
     return parser.parse_args()
 
