@@ -110,8 +110,25 @@ done
 # WORKERS_POOL_SIZE=1 makes should_process() accept every PR, so we see the
 # whole queue rather than one worker's shard. --no-status keeps us read-only:
 # we must not interfere with the statuses the builders set.
+# --cache-ttl: ONE process runs per pool, and the pools ask GitHub the same
+# questions. Measured 2026-09-26: 33 queries a cycle for 15 distinct
+# (repo, branch) pairs -- AliceO2Group/AliceO2 dev alone is asked once per pool
+# that carries an O2 check. At 2 points a query and a 120s cycle that is ~1980
+# of the fleet's shared 5000 points an hour, about 40% of the budget, spent
+# re-asking. Reusing an answer within a cycle takes it to ~900.
+#
+# 110s, just under QUEUE_METRICS_INTERVAL: every pool in one cycle shares an
+# answer, and the next cycle always starts cold, so a reading can never be older
+# than one interval. Walking the pools takes ~1 min, so the first pool's answer
+# is up to a minute old by the last pool -- well inside what a 120s collector
+# already claims about itself.
+#
+# SAFE HERE AND NOT IN A BUILDER: this is read-only (--no-status) and reports
+# queue depth. A builder choosing what to claim from a minute-old listing would
+# take PRs that are already built or miss ones that just arrived.
 if queue=$(WORKER_INDEX=0 WORKERS_POOL_SIZE=1 \
-           short_timeout list-branch-pr --all-groups --no-status)
+           short_timeout list-branch-pr --all-groups --no-status \
+                         --cache-ttl "${QUEUE_METRICS_CACHE_TTL:-110}")
 then
   poll_ok=1
 else

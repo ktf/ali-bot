@@ -26,10 +26,13 @@ was added while this list still described four.
 import functools
 import glob
 import hashlib
+import json
 import os
 import os.path
 import random
 import sys
+import tempfile
+import time
 
 from argparse import ArgumentParser, Namespace
 from collections import defaultdict
@@ -51,10 +54,70 @@ DEFAULTENV_NAME = "DEFAULTS.env"
 PRIORITY_LABEL = "ci-priority"
 
 
+#: Set from --cache-ttl / --cache-dir. Off by default, so every existing caller
+#: -- every builder -- keeps asking GitHub directly.
+_CACHE_TTL = 0
+_CACHE_DIR = None
+
+
+def _cache_file(org, repo, base_branch, include_base_branch):
+    """Where the answer for one (repo, branch) question lives."""
+    key = "\0".join((github_api_url(), org, repo, base_branch,
+                      str(bool(include_base_branch))))
+    return os.path.join(_CACHE_DIR,
+                        hashlib.sha256(key.encode()).hexdigest() + ".json")
+
+
+def _cache_read(path):
+    """The cached answer, or None if absent, stale or unreadable.
+
+    Anything unexpected reads as a miss: a cache that cannot be parsed must cost
+    one query, never a crash, and never a wrong answer.
+    """
+    try:
+        if time.time() - os.stat(path).st_mtime > _CACHE_TTL:
+            return None
+        with open(path) as cached:
+            return json.load(cached)
+    except (OSError, ValueError):
+        return None
+
+
+def _cache_write(path, value):
+    """Store an answer. Failure to cache is not failure to answer."""
+    try:
+        os.makedirs(_CACHE_DIR, mode=0o700, exist_ok=True)
+        # Written then renamed: the readers are other processes running
+        # concurrently with this one, and a half-written file must never be
+        # visible to them under the real name.
+        tmp = "%s.%d.tmp" % (path, os.getpid())
+        with open(tmp, "w") as out:
+            json.dump(value, out)
+        os.replace(tmp, path)
+    except (OSError, TypeError, ValueError):
+        pass
+
+
 @functools.lru_cache(maxsize=None)
 def query_repo_info(session, org, repo, base_branch, include_base_branch=False):
     """Query the given repo to get pull request statuses."""
-    return session.execute(GraphQLRequest(
+    # ACROSS PROCESSES, where lru_cache cannot reach. The queue collector runs
+    # one process per pool, and the pools ask the same questions: measured
+    # 2026-09-26, 33 queries a cycle for 15 distinct (repo, branch) pairs --
+    # AliceO2Group/AliceO2 dev alone is asked once per pool carrying an O2 check.
+    # At 2 GraphQL points a query and a 120s cycle that is ~1980 of the fleet's
+    # shared 5000 points an hour, about 40% of the budget, spent re-asking.
+    #
+    # Deliberately opt-in and off by default. A builder must decide what to claim
+    # from a listing that is current; only a read-only consumer can afford an
+    # answer a minute old.
+    if _CACHE_TTL > 0:
+        path = _cache_file(org, repo, base_branch, include_base_branch)
+        cached = _cache_read(path)
+        if cached is not None:
+            return cached["repository"]
+
+    result = session.execute(GraphQLRequest(
         QUERY.document,
         variable_values={
             "repoOwner": org,
@@ -63,7 +126,10 @@ def query_repo_info(session, org, repo, base_branch, include_base_branch=False):
             "includeBaseBranch": include_base_branch,
         },
         operation_name="statuses",
-    ))["repository"]
+    ))
+    if _CACHE_TTL > 0:
+        _cache_write(path, result)
+    return result["repository"]
 
 
 @functools.lru_cache(maxsize=None)
@@ -271,6 +337,12 @@ class RepoConfig:
 
 def main(args):
     """Script entry point."""
+    # getattr, not attribute access: main() is called directly by the tests with
+    # a hand-built Namespace, so a new option must not become a required field.
+    global _CACHE_TTL, _CACHE_DIR
+    _CACHE_TTL = getattr(args, "cache_ttl", 0) or 0
+    _CACHE_DIR = getattr(args, "cache_dir", None)
+
     grouped = defaultdict(list)
     # Find .env files for this worker, parse them and find PRs to process for
     # each build config.
@@ -438,6 +510,21 @@ def parse_args():
               " current Mesos role and container (default ALIBOT_CONFIG_SUFFIX="
               "%(default)s or empty if undefined). If %(metavar)s starts with a"
               " dash, use -s=%(metavar)s instead of -s %(metavar)s."))
+
+    parser.add_argument(
+        "--cache-ttl", metavar="SECONDS", type=int, default=0,
+        help=("Reuse another invocation's answer for the same repository and"
+              " branch if it is younger than %(metavar)s seconds (default"
+              " %(default)s, i.e. no reuse). FOR READ-ONLY CALLERS ONLY: a"
+              " builder deciding what to claim must not act on a stale"
+              " listing."))
+
+    parser.add_argument(
+        "--cache-dir", metavar="DIR",
+        default=os.environ.get("LIST_BRANCH_PR_CACHE_DIR") or
+                os.path.join(tempfile.gettempdir(),
+                             "list-branch-pr-cache-%d" % os.getuid()),
+        help="Where --cache-ttl keeps its answers (default %(default)s).")
 
     return parser.parse_args()
 
