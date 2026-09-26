@@ -26,16 +26,20 @@ was added while this list still described four.
 import functools
 import glob
 import hashlib
+import json
 import os
 import os.path
 import random
 import sys
+import tempfile
+import time
 
 from argparse import ArgumentParser, Namespace
 from collections import defaultdict
 from datetime import datetime, timezone
 
 from gql import Client, gql, GraphQLRequest
+from gql.transport.exceptions import TransportQueryError
 from gql.transport.requests import RequestsHTTPTransport
 from alibot_helpers.utilities import parse_env_file
 from alibot_helpers.github_utilities import \
@@ -51,10 +55,90 @@ DEFAULTENV_NAME = "DEFAULTS.env"
 PRIORITY_LABEL = "ci-priority"
 
 
+#: Stop querying once fewer than this many GraphQL points remain, leaving a
+#: reserve for the things that cannot back off -- a build reporting its own
+#: status, say. Every claim worker shares one budget, so a worker that spends
+#: the last of it takes the whole fleet down with it, which is what happened on
+#: 2026-09-26: wn-8 sat idle for seven hours retrying every 300s into an empty
+#: budget, because nothing here looked before spending.
+RATE_LIMIT_FLOOR = int(os.environ.get("GITHUB_RATE_LIMIT_FLOOR", "250"))
+
+#: Exit status for "GitHub said no, try later". 75 is EX_TEMPFAIL: distinct from
+#: 1 so the caller can tell a transient budget problem from a real failure and
+#: back off rather than hammering. claim-builder.sh keys its backoff on this.
+EX_TEMPFAIL = 75
+
+
+class RateLimitLow(Exception):
+    """Raised when the shared GraphQL budget is nearly spent."""
+
+
+#: Last rateLimit block seen, for the one-line report at exit.
+_LAST_RATE_LIMIT = {}
+
+
+#: Set from --cache-ttl / --cache-dir. Off by default, so every existing caller
+#: -- every builder -- keeps asking GitHub directly.
+_CACHE_TTL = 0
+_CACHE_DIR = None
+
+
+def _cache_file(org, repo, base_branch, include_base_branch):
+    """Where the answer for one (repo, branch) question lives."""
+    key = "\0".join((github_api_url(), org, repo, base_branch,
+                      str(bool(include_base_branch))))
+    return os.path.join(_CACHE_DIR,
+                        hashlib.sha256(key.encode()).hexdigest() + ".json")
+
+
+def _cache_read(path):
+    """The cached answer, or None if absent, stale or unreadable.
+
+    Anything unexpected reads as a miss: a cache that cannot be parsed must cost
+    one query, never a crash, and never a wrong answer.
+    """
+    try:
+        if time.time() - os.stat(path).st_mtime > _CACHE_TTL:
+            return None
+        with open(path) as cached:
+            return json.load(cached)
+    except (OSError, ValueError):
+        return None
+
+
+def _cache_write(path, value):
+    """Store an answer. Failure to cache is not failure to answer."""
+    try:
+        os.makedirs(_CACHE_DIR, mode=0o700, exist_ok=True)
+        # Written then renamed: the readers are other processes running
+        # concurrently with this one, and a half-written file must never be
+        # visible to them under the real name.
+        tmp = "%s.%d.tmp" % (path, os.getpid())
+        with open(tmp, "w") as out:
+            json.dump(value, out)
+        os.replace(tmp, path)
+    except (OSError, TypeError, ValueError):
+        pass
+
+
 @functools.lru_cache(maxsize=None)
 def query_repo_info(session, org, repo, base_branch, include_base_branch=False):
     """Query the given repo to get pull request statuses."""
-    return session.execute(GraphQLRequest(
+    # ACROSS PROCESSES, where lru_cache cannot reach. The collector runs one
+    # process per pool, and the pools ask the same questions: 33 queries for 15
+    # distinct (repo, branch) pairs, every 120s, unconditionally -- about 40% of
+    # the fleet's shared 5000/hour GraphQL budget spent on duplicates.
+    #
+    # Deliberately opt-in and off by default. A builder must decide what to
+    # claim from a listing that is current; only a read-only consumer can afford
+    # an answer a minute old.
+    if _CACHE_TTL > 0:
+        path = _cache_file(org, repo, base_branch, include_base_branch)
+        cached = _cache_read(path)
+        if cached is not None:
+            return cached["repository"]
+
+    result = session.execute(GraphQLRequest(
         QUERY.document,
         variable_values={
             "repoOwner": org,
@@ -63,7 +147,23 @@ def query_repo_info(session, org, repo, base_branch, include_base_branch=False):
             "includeBaseBranch": include_base_branch,
         },
         operation_name="statuses",
-    ))["repository"]
+    ))
+    # CHECKED AFTER THE QUERY, not before: `remaining` is only knowable by
+    # asking, and a dedicated probe would itself cost a point. So the first
+    # query of a round always goes through, and we stop before the next one.
+    rate = result.get("rateLimit") or {}
+    if rate:
+        _LAST_RATE_LIMIT.update(rate)
+        if rate.get("remaining", RATE_LIMIT_FLOOR) < RATE_LIMIT_FLOOR:
+            raise RateLimitLow(
+                "%s/%s GraphQL points left (floor %s), resets at %s" % (
+                    rate.get("remaining"), rate.get("limit"),
+                    RATE_LIMIT_FLOOR, rate.get("resetAt")))
+    # Stored AFTER the floor check, so a cached answer can never resurrect a
+    # budget reading that was already too low to act on.
+    if _CACHE_TTL > 0:
+        _cache_write(path, result)
+    return result["repository"]
 
 
 @functools.lru_cache(maxsize=None)
@@ -285,6 +385,15 @@ class RepoConfig:
 
 def main(args):
     """Script entry point."""
+    # Set before anything queries. Globals rather than threaded through every
+    # call site, because query_repo_info's lru_cache key must not grow two
+    # fields that are constant for the whole run.
+    global _CACHE_TTL, _CACHE_DIR
+    # getattr, not attribute access: main() is called directly by the tests with
+    # a hand-built Namespace, so a new option must not become a required field.
+    _CACHE_TTL = getattr(args, "cache_ttl", 0) or 0
+    _CACHE_DIR = getattr(args, "cache_dir", None)
+
     grouped = defaultdict(list)
     # Find .env files for this worker, parse them and find PRs to process for
     # each build config.
@@ -444,10 +553,7 @@ def main(args):
 
         rebuilds = [("failed", pull) for pull in grouped["failed"]] + \
                    [("succeeded", pull) for pull in grouped["succeeded"]]
-        for group, pull in sorted(rebuilds,
-                                  key=lambda item: (not item[1].get("urgent"),
-                                                    item[1].get("broken", 0),
-                                                    item[1].get("last_built") or "")):
+        for group, pull in sorted(rebuilds, key=_rebuild_key):
             emit_pr(group, pull)
     elif grouped["untested"]:
         # If there are untested PRs waiting, build all of them first.
@@ -538,6 +644,24 @@ def parse_args():
               "%(default)s or empty if undefined). If %(metavar)s starts with a"
               " dash, use -s=%(metavar)s instead of -s %(metavar)s."))
 
+    parser.add_argument(
+        "--cache-ttl", metavar="SECONDS", type=int, default=0,
+        help=("Reuse another invocation's answer for the same repository and"
+              " branch if it is younger than %(metavar)s seconds (default"
+              " %(default)s, i.e. no reuse). FOR READ-ONLY CALLERS ONLY: a"
+              " builder deciding what to claim must not act on a stale listing."
+              " Intended for the queue collector, which runs one process per"
+              " pool and so re-asks GitHub the same question up to 15 times a"
+              " cycle; those pools share only 15 distinct (repo, branch) pairs"
+              " between 33 queries."))
+
+    parser.add_argument(
+        "--cache-dir", metavar="DIR",
+        default=os.environ.get("LIST_BRANCH_PR_CACHE_DIR") or
+                os.path.join(tempfile.gettempdir(),
+                             "list-branch-pr-cache-%d" % os.getuid()),
+        help="Where --cache-ttl keeps its answers (default %(default)s).")
+
     return parser.parse_args()
 
 
@@ -548,6 +672,21 @@ query statuses(
   $baseBranch: String!
   $includeBaseBranch: Boolean!
 ) {
+  # FREE, and the only way anyone can see this coming. rateLimit is not billed
+  # and rides in the query we already send, so it costs no extra call.
+  #
+  # Measured 2026-09-26: this query costs 2 points against a 5000/hour budget.
+  # That is per (repo, branch), lru_cached per process -- so a ci-linux-x86
+  # worker spends 30 points per poll (15 distinct pairs across 7 containers) and
+  # seventeen of them idling on a 300s IDLE_SLEEP spend 6120/hour, more than the
+  # whole budget. Until this field existed, the first sign of trouble was
+  # "API rate limit already exceeded" with no idea who spent it.
+  rateLimit {
+    cost
+    limit
+    remaining
+    resetAt
+  }
   repository(owner: $repoOwner, name: $repoName) {
     # Fetch status for the latest commit on the base branch too, if requested.
     object(expression: $baseBranch) @include(if: $includeBaseBranch) {
@@ -626,5 +765,35 @@ query team($repoOwner: String!, $teamSlug: String!) {
 """)
 
 
+def _report_budget():
+    """One line on stderr saying what the budget looked like. Cheap, and the
+    only record of who spent it -- the log of a worker that went quiet is
+    otherwise indistinguishable from one with no work to do."""
+    if _LAST_RATE_LIMIT:
+        print("github graphql budget: %s/%s left, resets %s" % (
+            _LAST_RATE_LIMIT.get("remaining"), _LAST_RATE_LIMIT.get("limit"),
+            _LAST_RATE_LIMIT.get("resetAt")), file=sys.stderr)
+
+
 if __name__ == "__main__":
-    main(parse_args())
+    try:
+        main(parse_args())
+    except RateLimitLow as err:
+        # NOT an error: the budget is shared and nearly gone, so the right move
+        # is to stop asking. Distinct exit status so the caller backs off
+        # instead of retrying on its normal idle interval -- retrying into an
+        # empty budget is what turned a transient overshoot into a seven-hour
+        # outage on 2026-09-26.
+        print("refusing to list:", err, file=sys.stderr)
+        _report_budget()
+        sys.exit(EX_TEMPFAIL)
+    except TransportQueryError as err:
+        # The budget was ALREADY gone before we looked -- GitHub answers with a
+        # RATE_LIMIT error rather than a rateLimit block, so the floor above
+        # never gets a chance. Same treatment: tell the caller to wait.
+        if "RATE_LIMIT" in str(err) or "rate limit" in str(err).lower():
+            print("rate limited by github:", err, file=sys.stderr)
+            sys.exit(EX_TEMPFAIL)
+        raise
+    else:
+        _report_budget()
