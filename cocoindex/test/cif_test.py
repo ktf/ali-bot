@@ -5,19 +5,22 @@
 A fake S3 (fake_s3.py) serves a bucket built from REAL logs (trimmed, in
 fixtures/ci-logs/) plus synthetic ones; fake_github.py serves commit status
 histories, PR changed files, and prs_test.py's PR fixtures; fake_embedder.py
-logs every text it embeds. The runner runs FLOWS=commits,prs,ci-failures five
+logs every text it embeds. The runner runs FLOWS=commits,prs,ci-failures six
 times (so the store it leaves has all three databases, for mcp_test.py):
 
   1  bootstrap cut by CIF_MAX_LOGS=3: every build gets its verdict from
      pretty.html, only 3 logs are downloaded, ci_repos says the rest is pending
   2  resumes: the rest is extracted; failure kinds, signatures, in_pr_files,
-     status history; secrets scrubbed; one embedding per distinct signature
+     status history; secrets scrubbed; a crash's stack-trace fingerprint; every
+     error's line points at it in its log, and no log text is in the index;
+     one embedding per distinct signature
   3  the bucket changes: a red build re-run green on the same sha (key
      overwritten), a log deleted, an etag changed, a new PR with a known error.
      Old rows stay; only changed logs are downloaded; only new signatures embedded
   4  nothing changed: no log downloads, no embeddings, no snapshot
   5  a new host restores the snapshot (the extraction cache comes with the
      state): nothing re-downloaded, nothing re-embedded, same rows
+  6  a log extracted by an older logscan.EXTRACT_VERSION: only it is re-read
 
 Leaves the store at <workdir>/bucket/cocoindex for test/mcp_test.py.
 """
@@ -37,6 +40,8 @@ sys.path.insert(0, str(HERE))
 import prs_test  # noqa: E402  (build_origin, fixtures, helpers; its main() does not run on import)
 sys.path.insert(0, str(HERE.parent))
 import embedtext  # noqa: E402
+sys.path.insert(0, str(HERE.parent.parent / "ci-mcp"))
+import logscan  # noqa: E402
 
 RUNNER = HERE.parent / "runner.sh"
 FIX = HERE / "fixtures" / "ci-logs"
@@ -131,7 +136,18 @@ def secrets_log(when):
         "  -----BEGIN RSA PRIVATE KEY-----",
         f"  {s[7]}",
         "-----END RSA PRIVATE KEY-----",
-        "ninja: build stopped: subcommand failed."])])
+        "ninja: build stopped: subcommand failed."]), ("O2PhysicsTests", [
+        # A DPL device dying: its trace becomes a fingerprint, the reason (with a
+        # secret in it) stays in the private cache only, scrubbed.
+        f"[960:lambda-task]: [01:09:23][FATAL] token {s[0]} rejected by the CCDB",
+        "[960:lambda-task]: Executable is /sw/slc9_x86-64/O2Physics/local1/bin/o2-analysis-lf-secret",
+        "[960:lambda-task]:     /sw/slc9_x86-64/O2/local1/lib/libO2Framework.so:     ?? ??:0",
+        "[960:lambda-task]:     /sw/slc9_x86-64/O2Physics/local1/lib/libO2PhysicsLF.so: "
+        "SecretTask::process(o2::soa::Join<o2::aod::Tracks, o2::aod::TracksExtra> const&)",
+        "[960:lambda-task]:     /sw/slc9_x86-64/O2/local1/lib/libO2Framework.so: "
+        "o2::framework::DataProcessingDevice::doRun(o2::framework::ServiceRegistryRef)",
+        "[960:lambda-task]:     /lib64/libc.so.6:     ?? ??:0",
+        "[ERROR] Workflow crashed - PID 960 (lambda-task) did not exit correctly however it's not clear why."])])
 
 
 def flaky_log(when, green):
@@ -205,6 +221,25 @@ def pr_files():
     }
 
 
+def build_src_origin():
+    """A public "AliceO2" with the statement that prints the fixture's CCDB error
+    and the test ctest names, for srctemplates.py (SRC_REPOS)."""
+    d = WORK / "origins" / "AliceO2Group" / "AliceO2"
+    files = {
+        "CCDB/src/CcdbApi.cxx": 'void f() {\n  LOG(error) << "Requested resource does not exist: " << url;\n}\n',
+        "CCDB/test/testCcdbApiHeaders.cxx": "int main() { return 0; }\n",
+        "CCDB/CMakeLists.txt": "o2_add_test(CcdbApiHeaders SOURCES test/testCcdbApiHeaders.cxx)\n",
+        "README.md": "not a source file: not checked out\n",
+    }
+    for rel, text in files.items():
+        (d / rel).parent.mkdir(parents=True, exist_ok=True)
+        (d / rel).write_text(text)
+    git = lambda *a: subprocess.run(["git", "-C", str(d), *a], check=True, capture_output=True)
+    git("init", "-q", "-b", "dev")
+    git("add", "-A")
+    git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "sources")
+
+
 # ---------------------------------------------------------------- driver
 def main():
     if WORK.exists():
@@ -212,6 +247,7 @@ def main():
     WORK.mkdir(parents=True)
     heads, _ = prs_test.build_origin()
     build_bucket()
+    build_src_origin()
     eport, gport, sport = prs_test.free_port(), prs_test.free_port(), prs_test.free_port()
     elog, tlog, glog, slog = WORK / "embed.log", WORK / "texts.jsonl", WORK / "github.log", WORK / "s3.log"
     for f in (elog, tlog, glog, slog):
@@ -228,7 +264,8 @@ def main():
                     GIT_BASE_URL=f"file://{WORK}/origins",
                     GITHUB_GRAPHQL_URL=f"http://127.0.0.1:{gport}/graphql", GITHUB_TOKEN=TOKEN,
                     S3_ENDPOINT_URL=f"http://127.0.0.1:{sport}", AWS_ACCESS_KEY_ID=S3TOKEN,
-                    PRS_PAGE_SIZE="4", PRS_NESTED="3", CIF_FETCH_THREADS="2")
+                    PRS_PAGE_SIZE="4", PRS_NESTED="3", CIF_FETCH_THREADS="2",
+                    SRC_REPOS="AliceO2Group/AliceO2:dev", CIF_FILLER_KEY="cif-test-filler-key")
     texts = lambda: [json.loads(x) for x in tlog.read_text().splitlines()]
     s3reqs = lambda: [json.loads(x) for x in slog.read_text().splitlines()]
     ghreqs = lambda: [json.loads(x) for x in glog.read_text().splitlines()]
@@ -283,6 +320,10 @@ def main():
         rep = conn.execute("SELECT sum(pending), sum(builds), sum(extracted) FROM ci_repos").fetchone()
         check(tuple(rep) == (7, 10, 3), f"[1] ci_repos shows the bootstrap in progress {tuple(rep)}")
         check("left for later passes" in err, "[1] the flow says logs are left for later passes")
+        src = WORK / "hostA/sources/AliceO2Group__AliceO2"
+        check("srctemplates: 1 templates" in err and (src / "CCDB/src/CcdbApi.cxx").exists()
+              and not (src / "README.md").exists(),
+              "[1] the template sources are checked out sparse (C++ and CMake only) and indexed")
         print(f"     pass 1: {len(cif_texts(tt))} ci texts embedded, {len(s3r)} S3 requests", flush=True)
 
         # ---- 2: resume
@@ -351,7 +392,36 @@ def main():
         check(not leaked, f"[2] no planted secret in ci-failures.db, the cache or the embedded texts ({leaked})")
         b = build(conn, SECRETS)
         e = errors(conn, b["build_id"])
-        check(any("<redacted>" in x["text"] for x in e), "[2] secrets were replaced by <redacted>, the errors kept")
+        cache = sqlite3.connect(f"file:{files[1]}?mode=ro", uri=True)
+        cached = cache.execute("SELECT errors FROM build WHERE key = ?", (SECRETS + "/fullLog.txt",)).fetchone()[0]
+        cache.close()
+        check("<redacted>" in cached, "[2] secrets were replaced by <redacted> in the private cache, the errors kept")
+
+        # the index holds signatures and pointers into the log, never log text
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(ci_errors)")]
+        check("text" not in cols and "line" in cols, f"[2] ci_errors has a line and no text column ({cols})")
+        crash = [x for x in e if x["kind"] == "crash"]
+        check(len(crash) == 1 and crash[0]["sig_exact"] == "crash in lambda-task (o2-analysis-lf-secret): "
+              "SecretTask::process" and crash[0]["fatal"] and crash[0]["line"],
+              f"[2] a DPL crash is indexed as its stack-trace fingerprint ({[x['sig_exact'] for x in crash]})")
+        check(conn.execute("SELECT count(*) FROM ci_signatures WHERE sig_hash = ?",
+                           (crash and crash[0]["sig_hash"],)).fetchone()[0] == 1,
+              "[2] and the fingerprint is embedded like any failure signature")
+        bad = []
+        for r in conn.execute("SELECT e.kind, e.sig_exact, e.line, b.log_key FROM ci_errors e "
+                              "JOIN ci_builds b USING (build_id) WHERE b.current"):
+            if r["kind"] == "no-output":     # "No logs found": nothing in the log to point at
+                continue
+            if r["line"] is None:
+                bad.append(("no line", r["log_key"], r["sig_exact"][:60]))
+                continue
+            if r["kind"] == "crash" or r["kind"] in logscan.SIG_BODY_KINDS:
+                continue
+            log_lines = (WORK / "s3" / B / r["log_key"]).read_text(errors="replace").splitlines()
+            got = logscan.signature(logscan.scrub(log_lines[r["line"] - 1]), r["kind"])["sig_exact"]
+            if got != r["sig_exact"]:
+                bad.append((r["log_key"], r["line"], r["sig_exact"][:60], got[:60]))
+        check(not bad, f"[2] every error's line points at that error in its log ({bad[:3]})")
 
         # embeddings: one per distinct signature of a non-green build, nothing else
         check(all(t.startswith(embedtext.DOC_PREFIX) for t in texts() if t != "hello"),
@@ -419,6 +489,7 @@ def main():
               f"[4] no change: no downloads, listing only ({sorted({r['op'] for r in s3r})})")
         check(not tt, f"[4] no change: no embeddings ({len(tt)})")
         check("nothing published" in err, "[4] no change: no new snapshot")
+        check("heads unchanged, index kept" in err, "[4] no change: the template index is kept")
 
         # ---- 5: a new host restores
         err, tt, s3r, gh = run_pass("5", host="hostB")
@@ -428,10 +499,24 @@ def main():
         check(not [r for r in s3r if r["op"] in ("get", "range")], "[5] restored host: no log downloaded again")
         a, b2 = db("hostA"), db("hostB")
         for t, q in (("ci_builds", "SELECT * FROM ci_builds ORDER BY build_id"),
-                     ("ci_errors", "SELECT build_id, sig_hash, text, in_pr_files FROM ci_errors ORDER BY 1, 2"),
+                     ("ci_errors", "SELECT build_id, sig_hash, line, in_pr_files FROM ci_errors ORDER BY 1, 2"),
                      ("ci_signatures", "SELECT sig_hash, embedding FROM ci_signatures ORDER BY 1")):
             check([tuple(r) for r in a.execute(q)] == [tuple(r) for r in b2.execute(q)],
                   f"[5] restored host has the same {t}")
+
+        # ---- 6: a newer logscan.EXTRACT_VERSION re-reads what an older one extracted
+        old = WORK / "hostB/flows/ci-failures/state/s3/logs.db"
+        c = sqlite3.connect(old)
+        c.execute("UPDATE build SET extracted = ? WHERE key = ?", (logscan.EXTRACT_VERSION - 1, COMPILE + "/fullLog.txt"))
+        c.commit()
+        c.close()
+        q = "SELECT build_id, sig_hash, rank, sig_exact, line, count FROM ci_errors ORDER BY 1, 2"
+        before = [tuple(r) for r in db("hostB").execute(q)]
+        err, tt, s3r, gh = run_pass("6", host="hostB")
+        gets = [r["key"] for r in s3r if r["op"] == "get"]
+        check(gets == [COMPILE + "/fullLog.txt"], f"[6] only the log read by an older version is downloaded ({gets})")
+        check(not tt, f"[6] re-reading it embeds nothing new ({len(tt)})")
+        check([tuple(r) for r in db("hostB").execute(q)] == before, "[6] and its rows come back the same")
     finally:
         for p in procs:
             p.terminate()
