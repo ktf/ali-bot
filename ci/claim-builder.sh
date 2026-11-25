@@ -361,7 +361,15 @@ while true; do
   fi
 
   # The *.env files, from ali-bot@master exactly as the builders use.
-  reset_git_repository ali-bot https://github.com/alisw/ali-bot || :
+  #
+  # --branch master, so the checkout is fetched every round whatever state it is
+  # in. Without it reset_git_repository leaves a DETACHED checkout alone, and
+  # the override below detaches it: one round with ALIBOT_OVERRIDE set froze the
+  # config for good. All four arm Macs were found like that on 2026-11-24,
+  # reading a repo-config still pinning aliBuild v1.17.44 (master: v1.17.48)
+  # and blind to every *.env change pushed since -- the pushd/popd lines in the
+  # log with no "HEAD is now at" between them are the tell.
+  reset_git_repository ali-bot https://github.com/alisw/ali-bot --branch master || :
 
   # ...unless this worker is testing a candidate ali-bot, in which case the
   # config comes from the SAME ref as the code below. A PR is one thing: if it
@@ -375,9 +383,10 @@ while true; do
   if [ -n "$ALIBOT_OVERRIDE" ]; then
     (
       cd ali-bot || exit 1
-      # Detached, so reset_git_repository above leaves it alone from now on
-      # (it only resets when HEAD is on a branch) and this block owns the
-      # checkout. Re-fetched every round, so pushes to the PR are picked up.
+      # Applied over the master checkout above, every round: the reset puts
+      # master back first, so dropping ALIBOT_OVERRIDE returns the worker to
+      # master's config on its next round. Re-fetched every round, so pushes
+      # to the PR are picked up.
       short_timeout git fetch -f "https://github.com/${ALIBOT_OVERRIDE%@*}" \
                     "+${ALIBOT_OVERRIDE#*@}:refs/ab" &&
         git checkout -f refs/ab && git clean -fxd
@@ -866,11 +875,41 @@ EOF
     # nothing, every round, for as long as the job has existed. That is how
     # alimetal05 reached 1.3 TB in one work area and started failing other
     # people's builds with "ld: final link failed: No space left on device".
+    #
+    # -o: one line per work area it looked at, "env seconds symlinks
+    # bytes_freed bytes_free_before". A file and not stdout, because aliBuild's
+    # doClean prints there too. continuous-builder.sh pushed these as the
+    # `cleanup` table; the claim loop dropped them along with the cleanup step
+    # itself, so reinstating the step brought back the cleaning but not the
+    # numbers. Pushed the same way report_state does: InfluxDB while
+    # INFLUXDB_WRITE_URL is set, and Mimir (cleanup_<field>) when ROUND_SETUP
+    # has wired OTLP up. kib_avail is the space BEFORE cleaning, so a dashboard
+    # sees how close the disk came to full; after = kib_avail + kib_freed_approx.
+    _cleanup_metrics=$(mktemp "${TMPDIR:-/tmp}/cleanup-metrics.XXXXXX") || _cleanup_metrics=
     "$_cleanup_py" "$_cleanup_script" \
                -t "${CLEANUP_MAX_AGE_DAYS:-2}" -f "${CLEANUP_MIN_FREE_GIB:-50}" \
+               ${_cleanup_metrics:+-o "$_cleanup_metrics"} \
                -r "$_container" "$_role" "$_container$ALIBOT_CONFIG_SUFFIX" || true
+    [ -n "$_cleanup_metrics" ] &&
+    while read -r _env _sec _nsym _freed _avail; do (
+      # A subshell per line: source_env_files leaves the check's whole config
+      # behind, and the next build must not inherit it.
+      # shellcheck disable=SC2030,SC2031
+      MESOS_ROLE=$_role CUR_CONTAINER=$_container
+      source_env_files "$_env" > /dev/null 2>&1 || exit 0
+      set -- "host=$(hostname -s)" "os=$(uname -s | tr '[:upper:]' '[:lower:]')" \
+             "checkname=${CHECK_NAME:-$_env}" "repo=${PR_REPO:-unknown}" \
+             -- "duration_sec=$_sec" "num_symlinks_deleted=$_nsym" \
+             "kib_freed_approx=$((_freed / 1024))" "kib_avail=$((_avail / 1024))"
+      influxdb_push cleanup "$@"
+      if [ -n "${OTLP_METRICS_URL:-}" ]; then
+        otlp-push.py cleanup "$@" ||
+          echo "cleanup: OTLP push failed, continuing" >&2
+      fi
+    ); done < "$_cleanup_metrics"
+    [ -z "$_cleanup_metrics" ] || rm -f "$_cleanup_metrics"
   done
-  unset _entry _role _container _py _cleanup_py _cleanup_script
+  unset _entry _role _container _py _cleanup_py _cleanup_script _cleanup_metrics
 
   # A pass that built nothing AND skipped something only because it was cooling
   # is the one case the cooldown must never cause: the worker would sit idle on
